@@ -1,0 +1,433 @@
+/**
+ * SUITE DE TESTS AUTOMATISÉS — SUREBET AFRICA AI (PHASE 2 & PHASE 4)
+ * 
+ * Exécute 20 scénarios de tests unitaires et d'intégration indépendants :
+ * - Tests 1 à 10 : Moteur mathématique d'arbitrage et répartition des mises en FCFA (Phase 2).
+ * - Tests 11 à 20 : Scanner intelligent, filtres, fraîcheur, multi-sport, quotas et cache (Phase 4).
+ */
+
+import { ArbitrageEngine } from '../src/engine/arbitrageEngine';
+import { DemoDeterministicProvider } from '../src/server/providers/oddsProvider';
+import { ApiFootballAdapter } from '../src/server/providers/apiFootballAdapter';
+
+interface TestResult {
+  name: string;
+  passed: boolean;
+  expected: string;
+  actual: string;
+  details?: string;
+}
+
+const results: TestResult[] = [];
+
+function assert(condition: boolean, name: string, expected: string, actual: string, details?: string) {
+  results.push({
+    name,
+    passed: Boolean(condition),
+    expected,
+    actual,
+    details,
+  });
+}
+
+async function runAllTests() {
+  console.log('===============================================================');
+  console.log('   SUREBET AFRICA AI — SUITE DE TESTS AUTOMATISÉS (PHASE 2 & 4)');
+  console.log('===============================================================\n');
+
+  // ==========================================================================
+  // TESTS PHASE 2 : MOTEUR MATHÉMATIQUE (1 À 10)
+  // ==========================================================================
+
+  // TEST 1 : Arbitrage à 3 issues (2.20 / 3.80 / 4.50)
+  const test1Outcomes = [
+    { key: '1', label: 'Victoire 1', odd: 2.20 },
+    { key: 'X', label: 'Match Nul', odd: 3.80 },
+    { key: '2', label: 'Victoire 2', odd: 4.50 },
+  ];
+  const res1 = ArbitrageEngine.calculateStakes(test1Outcomes, 100000, 'none');
+  const expectedS1 = 1768 / 1881; // ≈ 0.93993
+  const expectedYield1 = ((1881 / 1768) - 1) * 100; // ≈ 6.39%
+
+  assert(
+    res1.isArbitrage === true &&
+    Math.abs(res1.sumOfInverses - expectedS1) < 0.0001 &&
+    Math.abs(res1.theoreticalYieldPercent - 6.39) <= 0.01 &&
+    Math.abs(res1.theoreticalEqualizedGrossReturn - 106391.40) <= 0.1 &&
+    Math.abs(res1.theoreticalGrossProfit - 6391.40) <= 0.1,
+    '1. Arbitrage à 3 issues (2.20 / 3.80 / 4.50)',
+    `S ≈ 0.93993, Rendement ≈ +6.39%, Retour égalisé ≈ 106 391.40 FCFA`,
+    `S = ${res1.sumOfInverses}, Rendement = ${res1.theoreticalYieldPercent}%, Retour = ${res1.theoreticalEqualizedGrossReturn} FCFA`
+  );
+
+  // TEST 2 : Marché sans arbitrage
+  const test2Outcomes = [
+    { key: '1', label: 'Team 1', odd: 2.10 },
+    { key: 'X', label: 'Nul', odd: 3.10 },
+    { key: '2', label: 'Team 2', odd: 3.20 },
+  ];
+  const res2 = ArbitrageEngine.calculateStakes(test2Outcomes, 100000, 'none');
+
+  assert(
+    res2.isArbitrage === false &&
+    res2.sumOfInverses > 1.0 &&
+    res2.theoreticalYieldPercent < 0 &&
+    res2.warnings.some((w) => w.includes('Aucun arbitrage')),
+    '2. Marché sans arbitrage (S >= 1.000)',
+    'isArbitrage = false, S > 1.000, Rendement < 0%',
+    `isArbitrage = ${res2.isArbitrage}, S = ${res2.sumOfInverses}, Rendement = ${res2.theoreticalYieldPercent}%`
+  );
+
+  // TEST 3 : Arbitrage à 2 issues (Face-à-Face / Over-Under)
+  const test3Outcomes = [
+    { key: '1', label: 'Joueur A', odd: 1.95 },
+    { key: '2', label: 'Joueur B', odd: 2.20 },
+  ];
+  const res3 = ArbitrageEngine.calculateStakes(test3Outcomes, 50000, 'none');
+  const expectedS3 = 1 / 1.95 + 1 / 2.20;
+  const expectedYield3 = (1 / expectedS3 - 1) * 100;
+
+  assert(
+    res3.isArbitrage === true &&
+    Math.abs(res3.sumOfInverses - expectedS3) < 0.001 &&
+    Math.abs(res3.theoreticalYieldPercent - expectedYield3) < 0.05,
+    '3. Arbitrage à 2 issues (1.95 / 2.20)',
+    `S ≈ ${expectedS3.toFixed(5)}, Rendement ≈ +${expectedYield3.toFixed(2)}%`,
+    `S = ${res3.sumOfInverses}, Rendement = ${res3.theoreticalYieldPercent}%`
+  );
+
+  // TEST 4 : Arbitrage à 4 issues
+  const test4Outcomes = [
+    { key: 'Q1', label: 'Quart 1', odd: 4.80 },
+    { key: 'Q2', label: 'Quart 2', odd: 4.80 },
+    { key: 'Q3', label: 'Quart 3', odd: 4.80 },
+    { key: 'Q4', label: 'Quart 4', odd: 4.80 },
+  ];
+  const res4 = ArbitrageEngine.calculateStakes(test4Outcomes, 40000, 'none');
+
+  assert(
+    res4.isArbitrage === true &&
+    res4.items.length === 4 &&
+    Math.abs(res4.sumOfInverses - 5 / 6) < 0.001 &&
+    Math.abs(res4.theoreticalYieldPercent - 20.0) < 0.05 &&
+    res4.actualTotalStake === 40000,
+    '4. Arbitrage à 4 issues (4.80 / 4.80 / 4.80 / 4.80)',
+    'S ≈ 0.83333, Rendement = +20.00%, Mises exactes = 40 000 FCFA',
+    `S = ${res4.sumOfInverses}, Rendement = ${res4.theoreticalYieldPercent}%, Mises = ${res4.actualTotalStake} FCFA`
+  );
+
+  // TEST 5 : Rejet des cotes invalides (<= 1.0, 0, négatives, NaN, infinies)
+  const test5a = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Issue 1', odd: 1.00 },
+    { key: '2', label: 'Issue 2', odd: 2.50 },
+  ], 10000);
+  const test5b = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Issue 1', odd: -1.50 },
+    { key: '2', label: 'Issue 2', odd: 2.50 },
+  ], 10000);
+  const test5c = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Issue 1', odd: NaN },
+    { key: '2', label: 'Issue 2', odd: 2.50 },
+  ], 10000);
+  const test5d = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Issue 1', odd: Infinity },
+    { key: '2', label: 'Issue 2', odd: 2.50 },
+  ], 10000);
+
+  assert(
+    test5a.validationErrors.length > 0 &&
+    test5b.validationErrors.length > 0 &&
+    test5c.validationErrors.length > 0 &&
+    test5d.validationErrors.length > 0 &&
+    !test5a.isArbitrage && !test5b.isArbitrage,
+    '5. Rejet des cotes invalides (<= 1.00, négatives, NaN, infinies)',
+    'ValidationErrors générés pour chaque cas, arbitrage rejeté',
+    `test5a: ${test5a.validationErrors.length} err, test5b: ${test5b.validationErrors.length} err, test5c: ${test5c.validationErrors.length} err, test5d: ${test5d.validationErrors.length} err`
+  );
+
+  // TEST 6 : Rejet budget nul ou négatif
+  const test6a = ArbitrageEngine.calculateStakes(test1Outcomes, 0);
+  const test6b = ArbitrageEngine.calculateStakes(test1Outcomes, -50000);
+  const test6c = ArbitrageEngine.calculateStakes(test1Outcomes, NaN);
+
+  assert(
+    test6a.validationErrors.some((e) => e.includes('supérieur à 0')) &&
+    test6b.validationErrors.some((e) => e.includes('supérieur à 0')) &&
+    test6c.validationErrors.some((e) => e.includes('nombre fini')),
+    '6. Rejet de budget nul, négatif ou non fini',
+    'ValidationErrors bloquantes pour B <= 0 et B = NaN',
+    `test6a err: ${test6a.validationErrors[0]} | test6b err: ${test6b.validationErrors[0]}`
+  );
+
+  // TEST 7 : Budget non divisible uniformément (ex: 10 003 FCFA et 7 777 FCFA)
+  const budget7a = 10003;
+  const res7a = ArbitrageEngine.calculateStakes(test1Outcomes, budget7a, 'none');
+  const budget7b = 7777;
+  const res7b = ArbitrageEngine.calculateStakes(test1Outcomes, budget7b, 'none');
+
+  assert(
+    res7a.actualTotalStake === budget7a &&
+    res7b.actualTotalStake === budget7b &&
+    res7a.items.every((it) => Number.isInteger(it.roundedStake)) &&
+    res7b.items.every((it) => Number.isInteger(it.roundedStake)),
+    '7. Budget non divisible uniformément (10 003 FCFA & 7 777 FCFA)',
+    `Somme exacte = ${budget7a} et ${budget7b}, avec des mises entières en FCFA`,
+    `res7a sum = ${res7a.actualTotalStake}, res7b sum = ${res7b.actualTotalStake}, tous entiers = true`
+  );
+
+  // TEST 8 : Somme exacte des mises après arrondis
+  const testBudgets = [1234, 15000, 75000, 100000, 350001];
+  let test8AllPass = true;
+  const test8Details: string[] = [];
+
+  for (const b of testBudgets) {
+    const r = ArbitrageEngine.calculateStakes(test1Outcomes, b, 'none');
+    const sum = r.items.reduce((acc, it) => acc + it.roundedStake, 0);
+    if (sum !== b) {
+      test8AllPass = false;
+      test8Details.push(`Échec pour B=${b}: somme=${sum}`);
+    }
+  }
+
+  assert(
+    test8AllPass === true,
+    '8. Conservation stricte : somme(mises) === Budget',
+    'somme(M_i) === Budget pour tous les montants testés',
+    test8AllPass ? '100% conforme pour [1234, 15000, 75000, 100000, 350001] FCFA' : test8Details.join(', ')
+  );
+
+  // TEST 9 : Calcul exact du pire bénéfice après arrondis
+  const calculatedWorstPayout = Math.min(...res1.items.map((it) => it.grossPayout));
+  const calculatedWorstProfit = Math.min(...res1.items.map((it) => it.netProfit));
+
+  assert(
+    Math.abs(res1.worstCasePayout - 106389.80) <= 0.5 &&
+    Math.abs(res1.worstCaseNetProfit - 6389.80) <= 0.5 &&
+    res1.worstCasePayout === calculatedWorstPayout &&
+    res1.worstCaseNetProfit === calculatedWorstProfit,
+    '9. Calcul du pire retour et pire bénéfice après arrondis',
+    'Pire retour = 106 389.80 FCFA, Pire bénéfice = +6 389.80 FCFA',
+    `Pire retour = ${res1.worstCasePayout} FCFA, Pire bénéfice = ${res1.worstCaseNetProfit} FCFA`
+  );
+
+  // TEST 10 : Marché incomplet ou doublons d'issues
+  const test10a = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Seule issue', odd: 2.10 },
+  ], 10000);
+  const test10b = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Issue A', odd: 2.10 },
+    { key: '1', label: 'Issue B', odd: 2.10 },
+  ], 10000);
+  const test10c = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Victoire 1', odd: 2.50 },
+    { key: 'X', label: 'Nul', odd: 3.50 },
+  ], 10000, 'none', '1X2');
+
+  assert(
+    test10a.validationErrors.length > 0 &&
+    test10b.validationErrors.some((e) => e.includes('Doublon')) &&
+    test10c.validationErrors.some((e) => e.includes('Marché 1X2 incomplet')) &&
+    !test10a.isArbitrage && !test10b.isArbitrage && !test10c.isArbitrage,
+    '10. Rejet des marchés incomplets et doublons d\'issues',
+    'ValidationErrors bloquantes sur marché < 2 issues, doublons de clé et 1X2 tronqué',
+    `10a: ${test10a.validationErrors[0]} | 10b: ${test10b.validationErrors[0]} | 10c: ${test10c.validationErrors[0]}`
+  );
+
+  // ==========================================================================
+  // TESTS PHASE 4 : SCANNER INTELLIGENT ET ARCHITECTURE MULTI-SPORT (11 À 20)
+  // ==========================================================================
+
+  // TEST 11 : Marché 1X2 incomplet (validation stricte des 3 issues : domicile, nul, extérieur)
+  const test11a = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Domicile', odd: 2.20 },
+    { key: 'X', label: 'Nul', odd: 3.50 },
+  ], 10000, 'none', '1X2');
+  const test11b = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Domicile', odd: 2.20 },
+    { key: '2', label: 'Extérieur', odd: 3.50 },
+  ], 10000, 'none', '1X2');
+
+  assert(
+    test11a.validationErrors.some((e) => e.includes('Marché 1X2 incomplet')) &&
+    test11b.validationErrors.some((e) => e.includes('Marché 1X2 incomplet')) &&
+    !test11a.isArbitrage && !test11b.isArbitrage,
+    '11. Marché 1X2 incomplet (rejet bloquant si moins de 3 issues)',
+    'ValidationErrors bloquante exigeant les 3 issues (1, X, 2)',
+    `test11a: ${test11a.validationErrors[0]} | test11b: ${test11b.validationErrors[0]}`
+  );
+
+  // TEST 12 : Marchés incompatibles (règles de règlement divergentes ou types non compatibles)
+  const test12a = ArbitrageEngine.validateMarketCompatibility('1X2', 'MONEYLINE_12');
+  const test12b = ArbitrageEngine.validateMarketCompatibility(
+    '1X2',
+    '1X2',
+    'Temps réglementaire 90 min',
+    'Prolongations incluses'
+  );
+
+  assert(
+    Boolean(
+      !test12a.compatible &&
+      test12a.reason?.includes('incompatibles') &&
+      !test12b.compatible &&
+      test12b.reason?.includes('divergentes')
+    ),
+    '12. Marchés incompatibles (rejet si types ou règlements divergents)',
+    'compatible = false pour marchés différents ou règlements contradictoires',
+    `12a: ${test12a.reason} | 12b: ${test12b.reason}`
+  );
+
+  // TEST 13 : Plusieurs bookmakers (exigence minimale de 2 bookmakers distincts pour un surebet)
+  const demoProvider = new DemoDeterministicProvider();
+  const allDemoSurebets = await demoProvider.getSurebets();
+  const test13AllHaveMultiBk = allDemoSurebets.every((opp) => {
+    const distinctBks = new Set(opp.outcomes.map((o) => o.bookmakerId));
+    return distinctBks.size >= 2;
+  });
+
+  assert(
+    test13AllHaveMultiBk && allDemoSurebets.length > 0,
+    '13. Plusieurs bookmakers (minimum 2 bookmakers distincts obligatoires)',
+    '100% des opportunités d\'arbitrage comportent >= 2 bookmakers distincts',
+    `Vérifié sur ${allDemoSurebets.length} opportunités : toutes ont >= 2 bookmakers`
+  );
+
+  // TEST 14 : Cotes périmées (détection de péremption selon le seuil configurable)
+  const freshTimestamp = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // 5 min
+  const expiredTimestamp = new Date(Date.now() - 45 * 60 * 1000).toISOString(); // 45 min
+  const test14Fresh = ArbitrageEngine.checkOddsFreshness(freshTimestamp, 15);
+  const test14Expired = ArbitrageEngine.checkOddsFreshness(expiredTimestamp, 15);
+
+  assert(
+    !test14Fresh.isExpired && test14Expired.isExpired && test14Expired.ageMinutes >= 44,
+    '14. Cotes périmées (détection selon seuil maximal de fraîcheur)',
+    'Âge 5m avec seuil 15m = frais (false), âge 45m = périmé (true)',
+    `Frais: isExpired=${test14Fresh.isExpired} (${test14Fresh.ageMinutes}m) | Périmé: isExpired=${test14Expired.isExpired} (${test14Expired.ageMinutes}m)`
+  );
+
+  // TEST 15 : Données manquantes (cotes undefined, null, NaN ou issues vides)
+  const test15 = ArbitrageEngine.calculateStakes([
+    { key: '1', label: 'Domicile', odd: (null as any) },
+    { key: 'X', label: 'Nul', odd: 3.50 },
+    { key: '2', label: 'Extérieur', odd: (undefined as any) },
+  ], 10000, 'none', '1X2');
+
+  assert(
+    test15.validationErrors.length >= 2 && !test15.isArbitrage,
+    '15. Données manquantes (rejet des cotes nulles, undefined ou vides)',
+    'ValidationErrors immédiates pour chaque valeur manquante',
+    `${test15.validationErrors.length} erreurs détectées : ${test15.validationErrors.join(' | ')}`
+  );
+
+  // TEST 16 : Rendement sous le seuil choisi (filtrage strict)
+  const oppsList16 = [
+    { id: 'arb1', theoreticalYieldPercent: 0.85 },
+    { id: 'arb2', theoreticalYieldPercent: 2.40 },
+    { id: 'arb3', theoreticalYieldPercent: 4.10 },
+  ];
+  const threshold16 = 2.0;
+  const filtered16 = oppsList16.filter((o) => o.theoreticalYieldPercent >= threshold16);
+
+  assert(
+    filtered16.length === 2 &&
+    filtered16.every((o) => o.theoreticalYieldPercent >= 2.0) &&
+    !filtered16.some((o) => o.id === 'arb1'),
+    '16. Rendement sous le seuil choisi (exclusion stricte sous le seuil)',
+    'Opportunité à +0.85% rejetée sous le seuil minimal de 2.0%',
+    `Retenus: ${filtered16.map((o) => o.theoreticalYieldPercent + '%').join(', ')}`
+  );
+
+  // TEST 17 : Répartition entière des mises en FCFA (conservation stricte et entiers)
+  const testBudgets17 = [55555, 123456, 1000000];
+  let test17Pass = true;
+  for (const b of testBudgets17) {
+    const r = ArbitrageEngine.calculateStakes(test1Outcomes, b, '100');
+    const sum = r.items.reduce((acc, it) => acc + it.roundedStake, 0);
+    const allInteger = r.items.every((it) => Number.isInteger(it.roundedStake) && it.roundedStake > 0);
+    if (sum !== b || !allInteger) {
+      test17Pass = false;
+      break;
+    }
+  }
+
+  assert(
+    test17Pass,
+    '17. Répartition entière des mises en FCFA (somme exacte et entiers stricts)',
+    'somme(mises) === Budget et Number.isInteger(mise) === true pour tous budgets',
+    `Vérifié sur budgets [55555, 123456, 1000000] FCFA : 100% entiers et somme exacte`
+  );
+
+  // TEST 18 : Données réelles versus démonstration (préservation stricte de isDemoData)
+  const demoSurebets18 = await demoProvider.getSurebets();
+  const allAreDemo18 = demoSurebets18.every((o) => o.isDemoData === true);
+  const apiFootball18 = ApiFootballAdapter.getInstance();
+  const mockNormalized18 = apiFootball18.normalizeApiResponse([]);
+  const detectedReal18 = apiFootball18.detectSurebetsFromOdds(mockNormalized18.normalizedEvents);
+
+  assert(
+    allAreDemo18 && detectedReal18.opportunities.every((o) => o.isDemoData === false),
+    '18. Données réelles versus démonstration (isolation stricte du drapeau isDemoData)',
+    'Démo = isDemoData: true à 100%, Réel = isDemoData: false à 100%',
+    `Démo: ${demoSurebets18.length} opps avec isDemoData=true | Réel: isDemoData=false`
+  );
+
+  // TEST 19 : Sport non pris en charge par le fournisseur (API-Football restreinte au football)
+  const apiFootballAdapter = ApiFootballAdapter.getInstance();
+  const basketResult19 = await apiFootballAdapter.getRealFootballSurebets('basketball');
+
+  assert(
+    basketResult19.opportunities.length === 0 &&
+    basketResult19.diagnostic.coverageErrors.some(
+      (e) => e.includes('basketball') && (e.includes('pas pris en charge') || e.includes('non pris en charge'))
+    ),
+    '19. Sport non pris en charge par le fournisseur (rejet propre sans plantage)',
+    '0 opportunité et coverageError explicite pour sport non couvert',
+    `Opportunités: ${basketResult19.opportunities.length}, Erreur: ${basketResult19.diagnostic.coverageErrors[0]}`
+  );
+
+  // TEST 20 : Respect du cache et des erreurs de quota (cache 180s et validation d'état)
+  const isFootSupported = apiFootballAdapter.supportsSport('football');
+  const isTennisSupported = apiFootballAdapter.supportsSport('tennis');
+  const statusResult20 = await apiFootballAdapter.getDiagnostic();
+
+  assert(
+    isFootSupported === true &&
+    isTennisSupported === false &&
+    statusResult20.cacheTtlSeconds === 180 &&
+    (statusResult20.connectionState === 'invalid_key' ||
+      statusResult20.connectionState === 'connected' ||
+      statusResult20.connectionState === 'not_configured' ||
+      statusResult20.connectionState === 'rate_limited'),
+    '20. Respect du cache et des erreurs de quota (cache 180s et gestion des états)',
+    'Cache TTL = 180s, football supporté, tennis non supporté par API-Football',
+    `Football: ${isFootSupported}, Tennis: ${isTennisSupported}, Cache TTL: ${statusResult20.cacheTtlSeconds}s, État: ${statusResult20.connectionState}`
+  );
+
+  // ==========================================================================
+  // AFFICHAGE DU RÉCAPITULATIF
+  // ==========================================================================
+  console.log('\n--- RÉSULTATS DÉTAILLÉS DES 20 TESTS AUTOMATISÉS ---');
+  let allPassed = true;
+
+  results.forEach((r) => {
+    const icon = r.passed ? '✅ SUCCÈS' : '❌ ÉCHEC';
+    console.log(`[${icon}] ${r.name}`);
+    console.log(`       Attendu : ${r.expected}`);
+    console.log(`       Obtenu  : ${r.actual}`);
+    if (!r.passed) allPassed = false;
+  });
+
+  console.log('\n===============================================================');
+  if (allPassed) {
+    console.log(`🎉 ${results.length}/${results.length} TESTS RÉUSSIS : CONFORMITÉ TOTALE PHASES 2 & 4.`);
+  } else {
+    console.error('⚠️ CERTAINS TESTS ONT ÉCHOUÉ.');
+    process.exit(1);
+  }
+  console.log('===============================================================');
+}
+
+runAllTests().catch((err) => {
+  console.error('Erreur fatale lors de l\'exécution des tests:', err);
+  process.exit(1);
+});

@@ -1,0 +1,577 @@
+import { TheOddsApiAdapter, TheOddsApiMatch } from '../src/server/providers/theOddsApiAdapter';
+import { ArbitrageEngine } from '../src/engine/arbitrageEngine';
+
+console.log('===============================================================');
+console.log('   SUREBET AFRICA AI — TESTS THE ODDS API V4 (LOT 4 AUDIT)');
+console.log('===============================================================');
+
+let passedTests = 0;
+let totalTests = 0;
+
+function assert(condition: boolean, testName: string, details?: string) {
+  totalTests++;
+  if (condition) {
+    passedTests++;
+    console.log(`[✅ SUCCÈS] ${testName}`);
+    if (details) console.log(`       ${details}`);
+  } else {
+    console.error(`[❌ ÉCHEC]  ${testName}`);
+    if (details) console.error(`       DÉTAIL : ${details}`);
+    process.exitCode = 1;
+  }
+}
+
+async function runTheOddsApiTests() {
+  const adapter = TheOddsApiAdapter.getInstance();
+
+  // Test 1 : Sécurité et masquage de la clé API
+  const isConfigured = adapter.isKeyConfigured();
+  const maskedNotice = adapter.getMaskedKeyNotice();
+  const rawKey = process.env.THE_ODDS_API_KEY || '';
+  const doesNotLeak = rawKey.length > 5 ? !maskedNotice.includes(rawKey) : true;
+  assert(
+    doesNotLeak && (isConfigured ? maskedNotice.includes('non exposée') : maskedNotice.includes('Non configurée')),
+    '1. Sécurité de la clé API : masquage strict et absence de fuite',
+    `Notice affichée : "${maskedNotice}" (fuite évitée: ${doesNotLeak})`
+  );
+
+  // Test 2 : Diagnostic et quotas
+  const diag = await adapter.getDiagnostic();
+  assert(
+    diag.providerId === 'the-odds-api' && (diag.connectionState === 'connected' || diag.connectionState === 'not_configured'),
+    '2. Endpoint de diagnostic The Odds API V4',
+    `État: ${diag.connectionState}, Quota restant: ${diag.requestsRemaining}, Latence: ${diag.latencyMs}ms`
+  );
+
+  // Test 3 : Mapping des clés de sports officielles vers les sports internes
+  const footballKeys = adapter.mapInternalSportToKeys('football');
+  const basketballKeys = adapter.mapInternalSportToKeys('basketball');
+  const tennisKeys = adapter.mapInternalSportToKeys('tennis');
+  assert(
+    footballKeys.includes('soccer_epl') &&
+    basketballKeys.includes('basketball_nba') &&
+    adapter.mapKeyToSportId('soccer_epl') === 'football' &&
+    adapter.mapKeyToSportId('basketball_nba') === 'basketball' &&
+    adapter.mapKeyToSportId('tennis_atp') === 'tennis',
+    '3. Mapping bidirectionnel des sports The Odds API vers le registre interne',
+    `Football: ${footballKeys[0]}, Basketball: ${basketballKeys[0]}`
+  );
+
+  // Match synthétique valide avec 2 bookmakers distincts
+  const syntheticArbMatch: TheOddsApiMatch = {
+    id: 'test-arb-epl-01',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Arsenal',
+    away_team: 'Chelsea',
+    bookmakers: [
+      {
+        key: 'onexbet',
+        title: '1xBet',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Arsenal', price: 2.45 },
+              { name: 'Chelsea', price: 2.90 },
+              { name: 'Draw', price: 3.40 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'betclic',
+        title: 'Betclic',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Arsenal', price: 2.10 },
+              { name: 'Chelsea', price: 3.80 },
+              { name: 'Draw', price: 3.90 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  // Test 4a : Fixtures synthétiques par défaut en mode démo
+  const arbDemoResult = adapter.detectSurebetsFromOdds([syntheticArbMatch], 30, 100000);
+  assert(
+    arbDemoResult.opportunities.length === 1 &&
+    arbDemoResult.opportunities[0].isDemoData === true &&
+    arbDemoResult.opportunities[0].provenance === 'demo' &&
+    arbDemoResult.opportunities[0].sumOfInverses < 1.0,
+    '4a. Les fixtures synthétiques sont explicitement en mode démo par défaut',
+    `isDemoData: ${arbDemoResult.opportunities[0]?.isDemoData}, provenance: ${arbDemoResult.opportunities[0]?.provenance}`
+  );
+
+  // Test 4b : La provenance réelle n'est affichée que si explicitement fournie
+  const arbRealResult = adapter.detectSurebetsFromOdds([syntheticArbMatch], 30, 100000, 'real');
+  assert(
+    arbRealResult.opportunities.length === 1 &&
+    arbRealResult.opportunities[0].isDemoData === false &&
+    arbRealResult.opportunities[0].provenance === 'real',
+    '4b. La provenance réelle n\'est affichée que si explicitement fournie par le connecteur',
+    `isDemoData: ${arbRealResult.opportunities[0]?.isDemoData}, provenance: ${arbRealResult.opportunities[0]?.provenance}`
+  );
+
+  // Test 5 : Marché sans arbitrage (S >= 1.000) -> Exactement 0 opportunité générée
+  const syntheticBalancedMatch: TheOddsApiMatch = {
+    id: 'test-bal-epl-02',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Liverpool',
+    away_team: 'Man City',
+    bookmakers: [
+      {
+        key: 'bet365',
+        title: 'Bet365',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Liverpool', price: 2.20 },
+              { name: 'Man City', price: 3.10 },
+              { name: 'Draw', price: 3.30 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'pinnacle',
+        title: 'Pinnacle',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Liverpool', price: 2.25 },
+              { name: 'Man City', price: 3.05 },
+              { name: 'Draw', price: 3.35 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const balancedResult = adapter.detectSurebetsFromOdds([syntheticBalancedMatch], 30, 100000);
+  assert(
+    balancedResult.opportunities.length === 0 &&
+    balancedResult.rejectedEvents.length === 1 &&
+    balancedResult.rejectedEvents[0].reasonCode === 'NO_ARBITRAGE',
+    '5. Marché équilibré (sans arbitrage) : 0 opportunité retournée sans faux résultats',
+    `Opportunités: ${balancedResult.opportunities.length}, Motif de rejet: ${balancedResult.rejectedEvents[0]?.reasonCode}`
+  );
+
+  // Test 6 : Rejet si 1 seul bookmaker présent dans le match (INSUFFICIENT_BOOKMAKERS)
+  const singleBkMatch: TheOddsApiMatch = {
+    id: 'test-single-03',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Tottenham',
+    away_team: 'Aston Villa',
+    bookmakers: [
+      {
+        key: 'onexbet',
+        title: '1xBet',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Tottenham', price: 2.50 },
+              { name: 'Aston Villa', price: 3.00 },
+              { name: 'Draw', price: 3.20 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const singleResult = adapter.detectSurebetsFromOdds([singleBkMatch], 30, 100000);
+  assert(
+    singleResult.opportunities.length === 0 &&
+    singleResult.rejectedEvents[0]?.reasonCode === 'INSUFFICIENT_BOOKMAKERS',
+    '6. Rejet obligatoire si moins de 2 bookmakers distincts présents dans le match',
+    `Motif: ${singleResult.rejectedEvents[0]?.reasonCode}`
+  );
+
+  // Test 7 : Rejet des opportunités issues d'un seul bookmaker pour les meilleures cotes
+  const monoBkWinningMatch: TheOddsApiMatch = {
+    id: 'test-mono-best-03b',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Juventus',
+    away_team: 'Milan',
+    bookmakers: [
+      {
+        key: 'bk1',
+        title: 'SuperBook',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Juventus', price: 3.50 }, // Meilleure cote
+              { name: 'Milan', price: 3.50 },    // Meilleure cote
+              { name: 'Draw', price: 3.50 },     // Meilleure cote
+            ],
+          },
+        ],
+      },
+      {
+        key: 'bk2',
+        title: 'LowBook',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Juventus', price: 2.00 },
+              { name: 'Milan', price: 2.00 },
+              { name: 'Draw', price: 2.00 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const monoBkResult = adapter.detectSurebetsFromOdds([monoBkWinningMatch], 30, 100000);
+  assert(
+    monoBkResult.opportunities.length === 0 &&
+    monoBkResult.rejectedEvents[0]?.reasonCode === 'INSUFFICIENT_BOOKMAKERS',
+    '7. Les opportunités issues d\'un seul bookmaker sont rejetées (diversité obligatoire)',
+    `Motif: ${monoBkResult.rejectedEvents[0]?.reasonCode} (${monoBkResult.rejectedEvents[0]?.reasonLabel})`
+  );
+
+  // Test 8 : Rejet si issue manquante dans un marché 3-way (INCOMPLETE_OUTCOMES)
+  const incompleteMatch: TheOddsApiMatch = {
+    id: 'test-inc-04',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Newcastle',
+    away_team: 'Brighton',
+    bookmakers: [
+      {
+        key: 'bk1',
+        title: 'Bookmaker 1',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Newcastle', price: 2.10 },
+              { name: 'Brighton', price: 3.50 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'bk2',
+        title: 'Bookmaker 2',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Newcastle', price: 2.15 },
+              { name: 'Brighton', price: 3.40 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const incResult = adapter.detectSurebetsFromOdds([incompleteMatch], 30, 100000);
+  assert(
+    incResult.opportunities.length === 0 &&
+    incResult.rejectedEvents[0]?.reasonCode === 'INCOMPLETE_OUTCOMES',
+    '8. Rejet si une issue obligatoire (Draw) est manquante sur 1X2',
+    `Motif: ${incResult.rejectedEvents[0]?.reasonCode}`
+  );
+
+  // Test 9 : Les cotes sans horodatage sont rejetées (MISSING_TIMESTAMP)
+  const noTimestampMatch: TheOddsApiMatch = {
+    id: 'test-notime-05',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Fulham',
+    away_team: 'Wolves',
+    bookmakers: [
+      {
+        key: 'bk1',
+        title: 'Bookmaker 1',
+        last_update: '', // Horodatage manquant !
+        markets: [
+          {
+            key: 'h2h',
+            last_update: '', // Horodatage manquant !
+            outcomes: [
+              { name: 'Fulham', price: 2.60 },
+              { name: 'Wolves', price: 3.80 },
+              { name: 'Draw', price: 3.90 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'bk2',
+        title: 'Bookmaker 2',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Fulham', price: 2.55 },
+              { name: 'Wolves', price: 3.85 },
+              { name: 'Draw', price: 3.95 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const noTimeResult = adapter.detectSurebetsFromOdds([noTimestampMatch], 30, 100000);
+  assert(
+    noTimeResult.opportunities.length === 0 &&
+    noTimeResult.rejectedEvents[0]?.reasonCode === 'MISSING_TIMESTAMP',
+    '9. Les cotes sans horodatage sont rejetées (MISSING_TIMESTAMP)',
+    `Motif: ${noTimeResult.rejectedEvents[0]?.reasonCode}`
+  );
+
+  // Test 10 : Les horodatages anormalement futurs sont rejetés (FUTURE_TIMESTAMP)
+  const futureTimestampMatch: TheOddsApiMatch = {
+    id: 'test-future-06',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Fulham',
+    away_team: 'Wolves',
+    bookmakers: [
+      {
+        key: 'bk1',
+        title: 'Bookmaker 1',
+        last_update: new Date(Date.now() + 300000).toISOString(), // 5 min dans le futur (> 120s)
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() + 300000).toISOString(),
+            outcomes: [
+              { name: 'Fulham', price: 2.60 },
+              { name: 'Wolves', price: 3.80 },
+              { name: 'Draw', price: 3.90 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'bk2',
+        title: 'Bookmaker 2',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Fulham', price: 2.55 },
+              { name: 'Wolves', price: 3.85 },
+              { name: 'Draw', price: 3.95 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const futureResult = adapter.detectSurebetsFromOdds([futureTimestampMatch], 30, 100000);
+  assert(
+    futureResult.opportunities.length === 0 &&
+    futureResult.rejectedEvents[0]?.reasonCode === 'FUTURE_TIMESTAMP',
+    '10. Les horodatages anormalement futurs (> 120s) sont rejetés (FUTURE_TIMESTAMP)',
+    `Motif: ${futureResult.rejectedEvents[0]?.reasonCode}`
+  );
+
+  // Test 11 : Rejet des cotes périmées selon le seuil (EXPIRED_ODDS)
+  const expiredMatch: TheOddsApiMatch = {
+    id: 'test-exp-07',
+    sport_key: 'soccer_epl',
+    sport_title: 'EPL',
+    commence_time: new Date(Date.now() + 3600000).toISOString(),
+    home_team: 'Fulham',
+    away_team: 'Wolves',
+    bookmakers: [
+      {
+        key: 'bk1',
+        title: 'Bookmaker 1',
+        last_update: new Date(Date.now() - 1000 * 60 * 50).toISOString(), // 50 min
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 1000 * 60 * 50).toISOString(),
+            outcomes: [
+              { name: 'Fulham', price: 2.60 },
+              { name: 'Wolves', price: 3.80 },
+              { name: 'Draw', price: 3.90 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'bk2',
+        title: 'Bookmaker 2',
+        last_update: new Date(Date.now() - 1000 * 60 * 50).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 1000 * 60 * 50).toISOString(),
+            outcomes: [
+              { name: 'Fulham', price: 2.55 },
+              { name: 'Wolves', price: 3.85 },
+              { name: 'Draw', price: 3.95 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const expResult = adapter.detectSurebetsFromOdds([expiredMatch], 15, 100000);
+  assert(
+    expResult.opportunities.length === 0 &&
+    expResult.rejectedEvents[0]?.reasonCode === 'EXPIRED_ODDS',
+    '11. Détection et rejet des cotes périmées selon le seuil configuré (15 min)',
+    `Motif: ${expResult.rejectedEvents[0]?.reasonCode}`
+  );
+
+  // Test 12 : Les listes de cotes vides ou invalides ne peuvent pas produire de surebet
+  const emptyInverses = ArbitrageEngine.calculateSumOfInverses([]);
+  const invalidInverses = ArbitrageEngine.calculateSumOfInverses([0.95, 2.50]);
+  const nanInverses = ArbitrageEngine.calculateSumOfInverses([NaN, 2.50]);
+  assert(
+    emptyInverses === Infinity &&
+    invalidInverses === Infinity &&
+    nanInverses === Infinity,
+    '12. calculateSumOfInverses renvoie Infinity pour listes vides ou cotes invalides',
+    `Vide: ${emptyInverses}, <= 1.0: ${invalidInverses}, NaN: ${nanInverses}`
+  );
+
+  // Test 13 : Les horodatages futurs ne sont pas considérés comme frais
+  const futureFreshness = ArbitrageEngine.checkOddsFreshness(new Date(Date.now() + 300000).toISOString(), 30);
+  assert(
+    futureFreshness.isExpired === true &&
+    futureFreshness.reason === 'FUTURE_TIMESTAMP',
+    '13. Les horodatages futurs ne sont pas considérés comme frais',
+    `isExpired: ${futureFreshness.isExpired}, reason: ${futureFreshness.reason}`
+  );
+
+  // Test 14 : Support 2-way pour basketball (Face-à-Face) et non déduction de live
+  const nbaArbMatch: TheOddsApiMatch = {
+    id: 'test-nba-arb-08',
+    sport_key: 'basketball_nba',
+    sport_title: 'NBA',
+    commence_time: new Date(Date.now() - 1800000).toISOString(), // Heure de début passée il y a 30 min !
+    home_team: 'Boston Celtics',
+    away_team: 'LA Lakers',
+    bookmakers: [
+      {
+        key: 'bk1',
+        title: 'Bookmaker 1',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Boston Celtics', price: 1.85 },
+              { name: 'LA Lakers', price: 2.10 },
+            ],
+          },
+        ],
+      },
+      {
+        key: 'bk2',
+        title: 'Bookmaker 2',
+        last_update: new Date(Date.now() - 60000).toISOString(),
+        markets: [
+          {
+            key: 'h2h',
+            last_update: new Date(Date.now() - 60000).toISOString(),
+            outcomes: [
+              { name: 'Boston Celtics', price: 1.70 },
+              { name: 'LA Lakers', price: 2.45 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const nbaResult = adapter.detectSurebetsFromOdds([nbaArbMatch], 30, 100000);
+  assert(
+    nbaResult.opportunities.length === 1 &&
+    nbaResult.opportunities[0].sportId === 'basketball' &&
+    nbaResult.opportunities[0].marketType === 'MONEYLINE_12' &&
+    nbaResult.opportunities[0].isLive === false, // Ne doit JAMAIS être déduit live juste parce que commence_time est passé
+    '14. Support 2-way Basketball et non-déduction de l\'état live depuis commence_time',
+    `isLive: ${nbaResult.opportunities[0]?.isLive} (commence_time passé mais non certifié live)`
+  );
+
+  // Test 15 : Intégration calcul FCFA des opportunités The Odds API
+  if (nbaResult.opportunities[0]) {
+    const opp = nbaResult.opportunities[0];
+    const rawOutcomes = opp.outcomes.map((o) => ({
+      key: o.key,
+      label: o.label,
+      odd: o.odd,
+      bookmakerId: o.bookmakerId,
+      bookmakerName: o.bookmakerName,
+    }));
+    const calc = ArbitrageEngine.calculateStakes(rawOutcomes, 75000, 'none', opp.marketType);
+    const sumStakes = calc.items.reduce((s, it) => s + it.roundedStake, 0);
+    const allIntegers = calc.items.every((it) => Number.isInteger(it.roundedStake));
+    assert(
+      sumStakes === 75000 && allIntegers && calc.isArbitrage,
+      '15. Mises en FCFA entières conformes sur opportunité réelle The Odds API',
+      `Budget 75000 FCFA -> Somme: ${sumStakes} FCFA, Entiers: ${allIntegers}, Pire bénéfice: ${calc.worstCaseNetProfit.toFixed(0)} FCFA`
+    );
+  }
+
+  console.log('===============================================================');
+  console.log(`RÉSULTAT THE ODDS API : ${passedTests}/${totalTests} TESTS PASSÉS.`);
+  console.log('===============================================================');
+
+  if (passedTests !== totalTests) {
+    process.exit(1);
+  }
+}
+
+runTheOddsApiTests().catch((err) => {
+  console.error('Erreur fatale test The Odds API:', err);
+  process.exit(1);
+});

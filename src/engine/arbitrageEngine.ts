@@ -1,0 +1,561 @@
+import {
+  CalculationResult,
+  RoundingMode,
+  StakeAllocationItem,
+  RiskLevel,
+} from '../types/surebet';
+
+export interface RawOutcomeInput {
+  key: string;
+  label: string;
+  odd: number;
+  bookmakerId?: string;
+  bookmakerName?: string;
+  officialUrl?: string;
+}
+
+/**
+ * MOTEUR MATHÉMATIQUE DÉTERMINISTE D'ARBITRAGE SPORTIF (SUREBET) — PHASE 2
+ * 
+ * Indépendant de l'interface graphique.
+ * Conforme aux exigences financières et mathématiques :
+ * - S = somme(1 / C_i)
+ * - Arbitrage si S < 1
+ * - Rendement théorique (%) = (1 / S - 1) * 100
+ * - Mise idéale M_i = B * (1 / C_i) / S
+ * - Retour brut égalisé idéal = B / S
+ * - Bénéfice brut théorique = B / S - B (jamais qualifié de bénéfice garanti)
+ * - Conservation stricte du budget : somme(Mises_arrondies) === Budget
+ * - Répartition déterministe des résidus pour minimiser l'écart des retours
+ * - Rejet strict des cas invalides (cotes <= 1, NaN, infini, budget négatif/nul, marché incomplet, doublons)
+ */
+export class ArbitrageEngine {
+  /**
+   * Valide rigoureusement l'ensemble des données d'entrée
+   */
+  public static validateInputs(
+    outcomes: RawOutcomeInput[],
+    totalStake: number,
+    marketType?: string
+  ): string[] {
+    const errors: string[] = [];
+
+    // 1. Validation du budget
+    if (
+      totalStake === undefined ||
+      totalStake === null ||
+      typeof totalStake !== 'number' ||
+      isNaN(totalStake) ||
+      !isFinite(totalStake)
+    ) {
+      errors.push('Le budget total doit être un nombre fini et valide.');
+    } else if (totalStake <= 0) {
+      errors.push('Le budget total en FCFA doit être strictement supérieur à 0.');
+    }
+
+    // 2. Validation des issues
+    if (!outcomes || !Array.isArray(outcomes) || outcomes.length < 2) {
+      errors.push('Un marché d\'arbitrage requiert au minimum 2 issues mutuellement exclusives.');
+      return errors;
+    }
+
+    // Si budget valide mais inférieur au nombre d'issues
+    if (typeof totalStake === 'number' && totalStake > 0 && totalStake < outcomes.length) {
+      errors.push(
+        `Le budget (${totalStake} FCFA) est insuffisant pour allouer au moins 1 FCFA par issue sur ${outcomes.length} issues.`
+      );
+    }
+
+    // 3. Détection des doublons d'issues
+    const keysSeen = new Set<string>();
+    const labelsSeen = new Set<string>();
+
+    outcomes.forEach((o, index) => {
+      const outcomeNum = index + 1;
+      const cleanKey = (o.key || '').trim().toLowerCase();
+      const cleanLabel = (o.label || '').trim().toLowerCase();
+
+      if (!cleanKey && !cleanLabel) {
+        errors.push(`L'issue ${outcomeNum} n'a ni clé ni libellé spécifié.`);
+      }
+
+      if (cleanKey) {
+        if (keysSeen.has(cleanKey)) {
+          errors.push(`Doublon détecté : la clé d'issue '${o.key}' est présente plusieurs fois.`);
+        }
+        keysSeen.add(cleanKey);
+      }
+
+      if (cleanLabel) {
+        if (labelsSeen.has(cleanLabel)) {
+          errors.push(`Doublon détecté : le libellé d'issue '${o.label}' est présent plusieurs fois.`);
+        }
+        labelsSeen.add(cleanLabel);
+      }
+
+      // 4. Validation des cotes individuelles
+      if (
+        o.odd === undefined ||
+        o.odd === null ||
+        typeof o.odd !== 'number' ||
+        isNaN(o.odd) ||
+        !isFinite(o.odd)
+      ) {
+        errors.push(
+          `Cote invalide pour l'issue ${outcomeNum} (${o.label || o.key}) : valeur non numérique ou non finie.`
+        );
+      } else if (o.odd <= 1.0) {
+        errors.push(
+          `Cote invalide pour l'issue ${outcomeNum} (${o.label || o.key}) : ${o.odd}. Les cotes doivent être strictement supérieures à 1.00.`
+        );
+      }
+    });
+
+    // 5. Validation de la complétude du marché selon son type
+    if (marketType) {
+      const keys = outcomes.map((o) => (o.key || '').toUpperCase());
+
+      if (marketType === '1X2' && outcomes.length !== 3) {
+        errors.push(
+          `Marché 1X2 incomplet : 3 issues exhaustives (1, X, 2) sont obligatoires. ${outcomes.length} issues fournies.`
+        );
+      }
+
+      if (marketType === 'MONEYLINE_12' && outcomes.length !== 2) {
+        errors.push(
+          `Marché Face-à-Face (Moneyline) incomplet : 2 issues exhaustives (1, 2) sont obligatoires.`
+        );
+      }
+
+      if (marketType === 'OVER_UNDER_2_5' && outcomes.length !== 2) {
+        errors.push(
+          `Marché Plus/Moins 2.5 incomplet : 2 issues exhaustives (Over, Under) sont obligatoires.`
+        );
+      }
+
+      if (marketType === 'BTTS' && outcomes.length !== 2) {
+        errors.push(
+          `Marché BTTS incomplet : 2 issues exhaustives (Oui, Non) sont obligatoires.`
+        );
+      }
+
+      if (marketType === 'TOTAL_POINTS' && outcomes.length !== 2) {
+        errors.push(
+          `Marché Total Points incomplet : 2 issues exhaustives (Over, Under) sont obligatoires.`
+        );
+      }
+    }
+
+    return errors;
+  }
+
+  /**
+   * Vérifie la compatibilité de deux marchés et de leurs règles de règlement
+   */
+  public static validateMarketCompatibility(
+    marketTypeA: string,
+    marketTypeB: string,
+    ruleA?: string,
+    ruleB?: string
+  ): { compatible: boolean; reason?: string } {
+    if (marketTypeA !== marketTypeB) {
+      return {
+        compatible: false,
+        reason: `Marchés incompatibles : impossible de combiner '${marketTypeA}' et '${marketTypeB}'. Les issues ne sont pas mutuellement exclusives et exhaustives.`,
+      };
+    }
+
+    if (ruleA && ruleB && ruleA.trim().toLowerCase() !== ruleB.trim().toLowerCase()) {
+      return {
+        compatible: false,
+        reason: `Règles de règlement divergentes : '${ruleA}' vs '${ruleB}'. Risque de perte en cas de prolongation ou égalité.`,
+      };
+    }
+
+    return { compatible: true };
+  }
+
+  /**
+   * Vérifie la fraîcheur temporelle des cotes d'un bookmaker
+   * Rejette les dates manquantes (MISSING_TIMESTAMP) et les dates futures > 120s (FUTURE_TIMESTAMP)
+   */
+  public static checkOddsFreshness(
+    providerUpdatedAt: string | undefined | null,
+    maxFreshnessMinutes: number
+  ): { isExpired: boolean; ageMinutes: number; isFuture?: boolean; reason?: 'EXPIRED_ODDS' | 'FUTURE_TIMESTAMP' | 'MISSING_TIMESTAMP' } {
+    if (!providerUpdatedAt || typeof providerUpdatedAt !== 'string' || !providerUpdatedAt.trim()) {
+      return { isExpired: true, ageMinutes: 999, reason: 'MISSING_TIMESTAMP' };
+    }
+    const updatedTime = new Date(providerUpdatedAt).getTime();
+    if (isNaN(updatedTime)) {
+      return { isExpired: true, ageMinutes: 999, reason: 'MISSING_TIMESTAMP' };
+    }
+    const now = Date.now();
+    const diffMs = now - updatedTime;
+
+    // Tolérance d'horloge de 120 secondes pour les légers décalages serveurs
+    if (diffMs < -120000) {
+      return {
+        isExpired: true,
+        isFuture: true,
+        ageMinutes: Math.floor(Math.abs(diffMs) / 60000),
+        reason: 'FUTURE_TIMESTAMP',
+      };
+    }
+
+    const ageMs = Math.max(0, diffMs);
+    const ageMinutes = Math.floor(ageMs / 60000);
+    const isExpired = ageMinutes > maxFreshnessMinutes;
+    return {
+      isExpired,
+      ageMinutes,
+      reason: isExpired ? 'EXPIRED_ODDS' : undefined,
+    };
+  }
+
+  /**
+   * Calcule la somme des inverses S = somme(1 / C_i)
+   * Renvoie Infinity pour une liste vide ou contenant une cote invalide (<= 1.0, NaN, non finie)
+   * afin d'échouer en sécurité mathématique absolue.
+   */
+  public static calculateSumOfInverses(odds: number[]): number {
+    if (!odds || !Array.isArray(odds) || odds.length === 0) return Infinity;
+    let sum = 0;
+    for (const odd of odds) {
+      if (
+        odd === undefined ||
+        odd === null ||
+        typeof odd !== 'number' ||
+        isNaN(odd) ||
+        !isFinite(odd) ||
+        odd <= 1.0
+      ) {
+        return Infinity;
+      }
+      sum += 1 / odd;
+    }
+    return sum;
+  }
+
+  /**
+   * Calcule le rendement théorique en pourcentage : (1 / S - 1) * 100
+   */
+  public static calculateYield(sumOfInverses: number): number {
+    if (sumOfInverses <= 0 || !isFinite(sumOfInverses) || sumOfInverses === Infinity) return 0;
+    return ((1 / sumOfInverses) - 1) * 100;
+  }
+
+  /**
+   * Détecte si une anomalie correspond à une erreur manifeste de saisie ("Palpable error")
+   */
+  public static detectPalpRisk(
+    sumOfInverses: number,
+    odds: number[]
+  ): { riskLevel: RiskLevel; reason?: string } {
+    const theoreticalYield = this.calculateYield(sumOfInverses);
+
+    if (theoreticalYield > 20) {
+      return {
+        riskLevel: 'ALERTE_ERREUR_PALP',
+        reason:
+          'Rendement théorique supérieur à 20% : Risque très élevé d\'erreur manifeste de cote (Palpable Error). Les bookmakers annulent généralement ces paris unilatéralement.',
+      };
+    }
+
+    if (theoreticalYield > 8) {
+      return {
+        riskLevel: 'MOYEN',
+        reason:
+          'Rendement théorique supérieur à 8% : Écart important. Risque accru de réajustement ou d\'annulation rapide par le bookmaker.',
+      };
+    }
+
+    const minOdd = Math.min(...odds);
+    if (minOdd < 1.05 && minOdd > 1.0) {
+      return {
+        riskLevel: 'MOYEN',
+        reason: 'Cote très faible (< 1.05) : marge d\'erreur nulle en cas d\'imprévu.',
+      };
+    }
+
+    return { riskLevel: 'FAIBLE' };
+  }
+
+  /**
+   * ALGORITHME DÉTERMINISTE D'ARRONDI ET DE RÉPARTITION DES RÉSIDUS
+   * 
+   * - Chaque mise finale est un montant entier en FCFA.
+   * - La somme des mises est EXACTEMENT égale au budget B.
+   * - Répartit les FCFA résiduels déterministement pour maximiser le pire retour
+   *   et minimiser les écarts entre les retours possibles.
+   */
+  public static allocateIntegerStakes(
+    idealStakes: number[],
+    odds: number[],
+    totalBudget: number,
+    step: number = 1
+  ): number[] {
+    const n = idealStakes.length;
+    if (n === 0) return [];
+    if (totalBudget < n) {
+      return idealStakes.map(() => 0);
+    }
+
+    // 1. Calcul des planchers initiaux
+    let stakes: number[];
+    if (step > 1 && totalBudget >= n * step) {
+      // Pas d'arrondi groupé (ex: 100, 500, 1000)
+      stakes = idealStakes.map((ideal) => {
+        const floored = Math.floor(ideal / step) * step;
+        return Math.max(step, floored);
+      });
+    } else {
+      // Pas au franc près (step = 1)
+      stakes = idealStakes.map((ideal) => Math.max(1, Math.floor(ideal)));
+    }
+
+    // 2. Calcul du reliquat résiduel
+    let currentSum = stakes.reduce((acc, s) => acc + s, 0);
+    let remainder = totalBudget - currentSum;
+
+    // Si la somme dépasse le budget (possible si forçage max(step, ...))
+    if (remainder < 0) {
+      let excess = -remainder;
+      while (excess > 0) {
+        // Retirer à l'issue qui a le retour le plus élevé et dont la mise > step
+        let bestIndex = -1;
+        let maxReturn = -Infinity;
+
+        for (let i = 0; i < n; i++) {
+          const minAllowed = step > 1 ? step : 1;
+          if (stakes[i] > minAllowed) {
+            const currentReturn = stakes[i] * odds[i];
+            if (currentReturn > maxReturn) {
+              maxReturn = currentReturn;
+              bestIndex = i;
+            }
+          }
+        }
+
+        if (bestIndex === -1) {
+          // Si aucune mise ne peut être réduite en respectant le step, on réduit de 1
+          for (let i = 0; i < n; i++) {
+            if (stakes[i] > 1) {
+              bestIndex = i;
+              break;
+            }
+          }
+        }
+
+        if (bestIndex !== -1) {
+          const decrement = Math.min(excess, step > 1 ? step : 1);
+          stakes[bestIndex] -= decrement;
+          excess -= decrement;
+        } else {
+          break;
+        }
+      }
+      currentSum = stakes.reduce((acc, s) => acc + s, 0);
+      remainder = totalBudget - currentSum;
+    }
+
+    // 3. Répartition déterministe du reliquat positif
+    // On alloue pas par pas à l'issue qui a actuellement le retour le plus faible (min return)
+    // afin de maximiser le pire des cas et de resserrer l'écart entre les retours.
+    const unitStep = step > 1 && remainder >= step ? step : 1;
+
+    while (remainder > 0) {
+      const increment = Math.min(remainder, unitStep);
+      let bestIndex = 0;
+      let minReturn = Infinity;
+
+      for (let i = 0; i < n; i++) {
+        const potentialReturn = stakes[i] * odds[i];
+        if (potentialReturn < minReturn) {
+          minReturn = potentialReturn;
+          bestIndex = i;
+        } else if (potentialReturn === minReturn) {
+          // En cas d'égalité stricte, départager par la plus grande partie fractionnaire idéale
+          const fracI = idealStakes[i] - Math.floor(idealStakes[i]);
+          const fracBest = idealStakes[bestIndex] - Math.floor(idealStakes[bestIndex]);
+          if (fracI > fracBest) {
+            bestIndex = i;
+          }
+        }
+      }
+
+      stakes[bestIndex] += increment;
+      remainder -= increment;
+    }
+
+    return stakes;
+  }
+
+  /**
+   * Calcul complet de la répartition des mises en FCFA avec validation stricte
+   */
+  public static calculateStakes(
+    outcomes: RawOutcomeInput[],
+    totalStake: number,
+    roundingMode: RoundingMode = 'none',
+    marketType?: string
+  ): CalculationResult {
+    // Étape 1 : Validation stricte des données d'entrée
+    const validationErrors = this.validateInputs(outcomes, totalStake, marketType);
+
+    if (validationErrors.length > 0) {
+      return {
+        sumOfInverses: 0,
+        theoreticalYieldPercent: 0,
+        isArbitrage: false,
+        targetTotalStake: totalStake || 0,
+        actualTotalStake: 0,
+        theoreticalEqualizedGrossReturn: 0,
+        theoreticalGrossProfit: 0,
+        roundingMode,
+        items: (outcomes || []).map((o) => ({
+          outcomeKey: o.key,
+          label: o.label,
+          odd: o.odd || 0,
+          bookmakerId: o.bookmakerId || '',
+          bookmakerName: o.bookmakerName || '',
+          officialUrl: o.officialUrl,
+          impliedProbabilityPercent: 0,
+          normalizedProbabilityPercent: 0,
+          exactStake: 0,
+          roundedStake: 0,
+          grossPayout: 0,
+          netProfit: 0,
+          roiPercent: 0,
+        })),
+        worstCasePayout: 0,
+        worstCaseNetProfit: 0,
+        worstCaseRoiPercent: 0,
+        bestCasePayout: 0,
+        bestCaseNetProfit: 0,
+        bestCaseRoiPercent: 0,
+        palpRiskDetected: false,
+        validationErrors,
+        warnings: [],
+      };
+    }
+
+    // Étape 2 : Calcul mathématique des inverses et du rendement
+    const odds = outcomes.map((o) => o.odd);
+    const sumOfInverses = this.calculateSumOfInverses(odds);
+    const isArbitrage = sumOfInverses < 1.0 && sumOfInverses > 0 && isFinite(sumOfInverses);
+    const theoreticalYieldPercent = this.calculateYield(sumOfInverses);
+    const palpRisk = this.detectPalpRisk(sumOfInverses, odds);
+
+    // Retour brut égalisé idéal = B / S
+    const theoreticalEqualizedGrossReturn = sumOfInverses > 0 && isFinite(sumOfInverses) ? totalStake / sumOfInverses : 0;
+    // Bénéfice brut théorique = B / S - B
+    const theoreticalGrossProfit = theoreticalEqualizedGrossReturn - totalStake;
+
+    const warnings: string[] = [];
+
+    if (!isArbitrage) {
+      warnings.push(
+        `Aucun arbitrage : la somme des inverses S (${isFinite(sumOfInverses) ? sumOfInverses.toFixed(5) : 'Infini'}) est supérieure ou égale à 1.000. Une répartition sur ce marché engendre une perte mathématique de ${(Math.abs(theoreticalYieldPercent)).toFixed(2)}%.`
+      );
+    }
+
+    if (palpRisk.reason) {
+      warnings.push(palpRisk.reason);
+    }
+
+    // Avertissement de non-garantie obligatoire
+    warnings.push(
+      'Avertissement financier : Ce résultat constitue un rendement théorique mathématique et ne doit jamais être qualifié de bénéfice garanti (risques de fluctuation des cotes, annulation unilatérale par le bookmaker, plafonds de mise).'
+    );
+
+    // Étape 3 : Mises idéales continues
+    const idealStakes = outcomes.map((o) => {
+      const inverse = 1 / o.odd;
+      const normalizedProbability = sumOfInverses > 0 && isFinite(sumOfInverses) ? inverse / sumOfInverses : 1 / outcomes.length;
+      return totalStake * normalizedProbability;
+    });
+
+    // Étape 4 : Arrondi déterministe et répartition des résidus
+    let step = 1;
+    if (roundingMode === '100') step = 100;
+    else if (roundingMode === '500') step = 500;
+    else if (roundingMode === '1000') step = 1000;
+
+    const roundedStakes = this.allocateIntegerStakes(idealStakes, odds, totalStake, step);
+
+    // Somme exacte vérifiée
+    const actualTotalStake = roundedStakes.reduce((acc, s) => acc + s, 0);
+
+    // Étape 5 : Construction des items et recalcul post-arrondis
+    let worstCasePayout = Infinity;
+    let worstCaseNetProfit = Infinity;
+    let bestCasePayout = -Infinity;
+    let bestCaseNetProfit = -Infinity;
+
+    const items: StakeAllocationItem[] = outcomes.map((outcome, idx) => {
+      const inverse = 1 / outcome.odd;
+      const impliedProbabilityPercent = inverse * 100;
+      const normalizedProbabilityPercent = sumOfInverses > 0 ? (inverse / sumOfInverses) * 100 : 0;
+      const exactStake = idealStakes[idx];
+      const roundedStake = roundedStakes[idx];
+
+      // Retour brut réel = mise * cote
+      const grossPayout = Number((roundedStake * outcome.odd).toFixed(2));
+      // Bénéfice net réel = retour - mise totale
+      const netProfit = Number((grossPayout - actualTotalStake).toFixed(2));
+      const roiPercent = actualTotalStake > 0 ? (netProfit / actualTotalStake) * 100 : 0;
+
+      if (grossPayout < worstCasePayout) {
+        worstCasePayout = grossPayout;
+        worstCaseNetProfit = netProfit;
+      }
+      if (grossPayout > bestCasePayout) {
+        bestCasePayout = grossPayout;
+        bestCaseNetProfit = netProfit;
+      }
+
+      return {
+        outcomeKey: outcome.key,
+        label: outcome.label,
+        odd: outcome.odd,
+        bookmakerId: outcome.bookmakerId || '',
+        bookmakerName: outcome.bookmakerName || '',
+        officialUrl: outcome.officialUrl,
+        impliedProbabilityPercent: Number(impliedProbabilityPercent.toFixed(2)),
+        normalizedProbabilityPercent: Number(normalizedProbabilityPercent.toFixed(2)),
+        exactStake: Number(exactStake.toFixed(2)),
+        roundedStake,
+        grossPayout,
+        netProfit,
+        roiPercent: Number(roiPercent.toFixed(2)),
+      };
+    });
+
+    const worstCaseRoiPercent =
+      actualTotalStake > 0 ? (worstCaseNetProfit / actualTotalStake) * 100 : 0;
+    const bestCaseRoiPercent =
+      actualTotalStake > 0 ? (bestCaseNetProfit / actualTotalStake) * 100 : 0;
+
+    return {
+      sumOfInverses: isFinite(sumOfInverses) ? Number(sumOfInverses.toFixed(5)) : Infinity,
+      theoreticalYieldPercent: Number(theoreticalYieldPercent.toFixed(2)),
+      isArbitrage,
+      targetTotalStake: totalStake,
+      actualTotalStake,
+      theoreticalEqualizedGrossReturn: Number(theoreticalEqualizedGrossReturn.toFixed(2)),
+      theoreticalGrossProfit: Number(theoreticalGrossProfit.toFixed(2)),
+      roundingMode,
+      items,
+      worstCasePayout: Number(worstCasePayout.toFixed(2)),
+      worstCaseNetProfit: Number(worstCaseNetProfit.toFixed(2)),
+      worstCaseRoiPercent: Number(worstCaseRoiPercent.toFixed(2)),
+      bestCasePayout: Number(bestCasePayout.toFixed(2)),
+      bestCaseNetProfit: Number(bestCaseNetProfit.toFixed(2)),
+      bestCaseRoiPercent: Number(bestCaseRoiPercent.toFixed(2)),
+      palpRiskDetected: palpRisk.riskLevel === 'ALERTE_ERREUR_PALP',
+      validationErrors: [],
+      warnings,
+    };
+  }
+}

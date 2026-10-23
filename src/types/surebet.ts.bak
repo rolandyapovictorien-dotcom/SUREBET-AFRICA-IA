@@ -1,0 +1,272 @@
+export type SportId =
+  | 'football'
+  | 'basketball'
+  | 'tennis'
+  | 'volleyball'
+  | 'hockey'
+  | 'rugby'
+  | 'baseball'
+  | 'cricket'
+  | 'mma'
+  | 'handball'
+  | 'boxing'
+  | 'motorsport'
+  | 'esports';
+
+export interface Sport {
+  id: SportId;
+  name: string;
+  icon: string;
+  status: 'active_demo' | 'planned_integration';
+  preMatchAvailable: boolean;
+  liveAvailable: boolean;
+  activeMatchesCount: number;
+  marketsSupported: string[];
+  realProviderSupported?: boolean;
+  realProviderNote?: string;
+}
+
+export type MarketType =
+  | '1X2'
+  | 'MONEYLINE_12'
+  | 'OVER_UNDER_2_5'
+  | 'BTTS'
+  | 'TOTAL_POINTS';
+
+export interface OutcomeDef {
+  key: string;
+  label: string;
+  odd: number;
+  bookmakerId: string;
+  bookmakerName: string;
+  bookmakerLogo?: string;
+  officialUrl?: string;
+  timestamp: string; // ISO string
+}
+
+export interface BookmakerInfo {
+  id: string;
+  name: string;
+  shortName: string;
+  countryNotice: string;
+  isVerifiedInCI: boolean;
+  officialDomain: string;
+  depositMethods: string[];
+  reliabilityScore: number;
+}
+
+export type RiskLevel = 'FAIBLE' | 'MOYEN' | 'ALERTE_ERREUR_PALP';
+
+export type RejectionReasonCode =
+  | 'INSUFFICIENT_BOOKMAKERS'
+  | 'INCOMPLETE_OUTCOMES'
+  | 'INCOMPATIBLE_RULES'
+  | 'INVALID_ODDS'
+  | 'EXPIRED_ODDS'
+  | 'NO_ARBITRAGE';
+
+export interface RejectedEventSummary {
+  id: string;
+  fixtureId?: number | string;
+  sportId: SportId;
+  competition: string;
+  match: string;
+  marketType: MarketType;
+  marketLabel: string;
+  reasonCode: RejectionReasonCode;
+  reasonLabel: string;
+  bookmakersObserved: string[];
+  bestOddsFound?: Record<string, number>;
+  sumOfInverses?: number;
+  theoreticalYield?: number;
+  providerUpdatedAt?: string;
+}
+
+export interface ScannerStats {
+  totalScanned: number;
+  validArbitragesCount: number;
+  rejectedCount: number;
+  rejectedByReason: Record<RejectionReasonCode, number>;
+}
+
+export interface SurebetOpportunity {
+  id: string;
+  sportId: SportId;
+  sportName: string;
+  competition: string;
+  homeTeam: string;
+  awayTeam: string;
+  startTime: string; // ISO date
+  isLive: boolean;
+  liveScore?: string;
+  liveMinute?: string;
+  marketType: MarketType;
+  marketLabel: string;
+  settlementRule?: string; // Règles de règlement (ex: temps réglementaire 90 min)
+  outcomes: OutcomeDef[];
+  sumOfInverses: number; // S = sum(1/odd_i)
+  theoreticalYieldPercent: number; // ((1/S) - 1) * 100
+  freshnessSeconds: number;
+  detectedAt: string; // Heure de détection par le scanner
+  collectedAt: string; // Heure de collecte côté serveur / fetch API
+  providerUpdatedAt: string; // Heure de dernière mise à jour de la cote par le bookmaker/fournisseur
+  isExpired?: boolean; // True si l'âge de la cote dépasse le seuil configuré
+  validationStatus: 'VALIDATED' | 'EXPIRED' | 'INSUFFICIENT_COVERAGE' | 'PALP_ALERT';
+  validationMessage: string;
+  riskLevel: RiskLevel;
+  riskReason?: string;
+  isFavorite?: boolean;
+  isDemoData: boolean;
+}
+
+export type RoundingMode = 'none' | '100' | '500' | '1000';
+
+export interface StakeAllocationItem {
+  outcomeKey: string;
+  label: string;
+  odd: number;
+  bookmakerId: string;
+  bookmakerName: string;
+  officialUrl?: string;
+  impliedProbabilityPercent: number; // (1/odd) * 100
+  normalizedProbabilityPercent: number; // ((1/odd) / S) * 100
+  exactStake: number;
+  roundedStake: number;
+  grossPayout: number; // roundedStake * odd
+  netProfit: number; // grossPayout - actualTotalStake
+  roiPercent: number; // (netProfit / actualTotalStake) * 100
+}
+
+export interface CalculationResult {
+  sumOfInverses: number;
+  theoreticalYieldPercent: number;
+  isArbitrage: boolean;
+  targetTotalStake: number;
+  actualTotalStake: number;
+  theoreticalEqualizedGrossReturn: number; // B / S
+  theoreticalGrossProfit: number; // B / S - B
+  roundingMode: RoundingMode;
+  items: StakeAllocationItem[];
+  worstCasePayout: number;
+  worstCaseNetProfit: number;
+  worstCaseRoiPercent: number;
+  bestCasePayout: number;
+  bestCaseNetProfit: number;
+  bestCaseRoiPercent: number;
+  palpRiskDetected: boolean;
+  validationErrors: string[];
+  warnings: string[];
+}
+
+export interface OddsSnapshot {
+  eventId: string;
+  sportId: SportId;
+  competition: string;
+  homeTeam: string;
+  awayTeam: string;
+  startTime: string;
+  isLive: boolean;
+  liveScore?: string;
+  liveMinute?: string;
+  markets: {
+    marketType: MarketType;
+    marketLabel: string;
+    bookmakerOdds: {
+      bookmakerId: string;
+      bookmakerName: string;
+      odds: Record<string, number>;
+      timestamp: string;
+    }[];
+  }[];
+}
+
+export interface ProviderStatus {
+  id: string;
+  name: string;
+  type: 'DEMO_DETERMINISTIC' | 'THE_ODDS_API' | 'SPORTMONKS' | 'RAPID_API';
+  status: 'active' | 'configured' | 'missing_key';
+  latencyMs: number;
+  requestsUsedToday: number;
+  dailyQuota: number;
+  lastUpdated: string;
+  description: string;
+}
+
+export interface UserSettings {
+  defaultStake: number;
+  minYieldThreshold: number;
+  maxFreshnessMinutes: number;
+  roundingMode: RoundingMode;
+  timezone: string;
+  audioAlertsEnabled: boolean;
+}
+
+export interface HistoryOpportunity {
+  id: string;
+  match: string;
+  competition: string;
+  sport: string;
+  sportIcon: string;
+  market: string;
+  yieldPercent: number;
+  sumOfInverses: number;
+  durationMinutes: number;
+  detectedAt: string;
+  closedAt: string;
+  outcomes: { label: string; bookmaker: string; odd: number }[];
+  resolutionNote: string;
+  isDemoData: boolean;
+}
+
+export type ConnectionState =
+  | 'not_configured'
+  | 'connected'
+  | 'invalid_key'
+  | 'rate_limited'
+  | 'network_error';
+
+export interface ApiFootballDiagnostic {
+  providerId: string;
+  providerName: string;
+  connectionState: ConnectionState;
+  isKeyConfigured: boolean;
+  maskedKeyNotice: string;
+  accountEmail?: string;
+  planName?: string;
+  requestsUsedToday: number;
+  dailyLimit: number;
+  latencyMs: number;
+  lastCheckedAt: string;
+  cacheTtlSeconds: number;
+  lastCollectTimestamp?: string;
+  message: string;
+  accessibleCompetitions: { id: number; name: string; country: string }[];
+  observedBookmakers: { id: number; name: string; isAfricanRelevant?: boolean }[];
+  availableMarkets: { id: number; name: string; key: MarketType }[];
+  scannedEventsCount: number;
+  insufficientCoverageCount: number;
+  coverageErrors: string[];
+}
+
+export interface TheOddsApiDiagnostic {
+  providerId: string;
+  providerName: string;
+  connectionState: ConnectionState;
+  isKeyConfigured: boolean;
+  maskedKeyNotice: string;
+  requestsRemaining?: number;
+  requestsUsed?: number;
+  requestsLastCost?: number;
+  dailyLimit?: number;
+  latencyMs: number;
+  lastCheckedAt: string;
+  cacheTtlSeconds: number;
+  message: string;
+  activeSportsCount?: number;
+  totalSportsCount?: number;
+  scannedEventsCount: number;
+  insufficientCoverageCount: number;
+  coverageErrors: string[];
+}
+
+export type DataSourceMode = 'demo' | 'real_api_football' | 'the_odds_api';

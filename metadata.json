@@ -1,0 +1,6 @@
+{
+  "name": "SUREBET AFRICA AI",
+  "description": "Plateforme SaaS d'analyse de cotes sportives, détection d'arbitrage (surebets) multi-sports et calculateur de mises en FCFA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

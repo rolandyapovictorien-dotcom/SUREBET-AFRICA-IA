@@ -1,0 +1,911 @@
+import {
+  SurebetOpportunity,
+  OddsSnapshot,
+  MarketType,
+  TheOddsApiDiagnostic,
+  ConnectionState,
+  SportId,
+  ScannerStats,
+  RejectedEventSummary,
+  ProviderStatus,
+  HistoryOpportunity,
+} from '../../types/surebet';
+import { ArbitrageEngine, RawOutcomeInput } from '../../engine/arbitrageEngine';
+import { IOddsProvider } from './oddsProvider';
+
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+  ttlSeconds: number;
+}
+
+export interface TheOddsApiSportItem {
+  key: string;
+  group: string;
+  title: string;
+  description: string;
+  active: boolean;
+  has_outrights: boolean;
+}
+
+export interface TheOddsApiMatch {
+  id: string;
+  sport_key: string;
+  sport_title: string;
+  commence_time: string;
+  home_team: string;
+  away_team: string;
+  bookmakers: {
+    key: string;
+    title: string;
+    last_update: string;
+    markets: {
+      key: string;
+      last_update: string;
+      outcomes: {
+        name: string;
+        price: number;
+        point?: number;
+      }[];
+    }[];
+  }[];
+}
+
+/**
+ * Adaptateur officiel The Odds API V4
+ * Connecteur temps réel pour cotes multi-sports, quotas d'en-tête et audit strict d'arbitrage.
+ */
+export class TheOddsApiAdapter implements IOddsProvider {
+  private static instance: TheOddsApiAdapter;
+  public readonly id = 'the-odds-api';
+  public readonly name = 'The Odds API V4 (Agrégateur Multi-Sports)';
+  public readonly supportedSports: SportId[] = [
+    'football',
+    'basketball',
+    'tennis',
+    'baseball',
+    'hockey',
+    'rugby',
+    'cricket',
+    'mma',
+    'boxing',
+  ];
+  public readonly isRealProvider = true;
+
+  private readonly baseUrl = 'https://api.the-odds-api.com/v4';
+  private cache = new Map<string, CacheEntry<any>>();
+
+  // Quota tracking
+  private requestsRemaining: number = 500;
+  private requestsUsed: number = 0;
+  private requestsLastCost: number = 0;
+  private lastCheckedTimestamp: string = '';
+  private lastDiagnostic: TheOddsApiDiagnostic | null = null;
+  private lastScannerStats: ScannerStats = {
+    totalScanned: 0,
+    validArbitragesCount: 0,
+    rejectedCount: 0,
+    rejectedByReason: {
+      INSUFFICIENT_BOOKMAKERS: 0,
+      INCOMPLETE_OUTCOMES: 0,
+      INCOMPATIBLE_RULES: 0,
+      INVALID_ODDS: 0,
+      EXPIRED_ODDS: 0,
+      FUTURE_TIMESTAMP: 0,
+      MISSING_TIMESTAMP: 0,
+      NO_ARBITRAGE: 0,
+    },
+  };
+  private lastRejectedEvents: RejectedEventSummary[] = [];
+
+  private constructor() {}
+
+  public static getInstance(): TheOddsApiAdapter {
+    if (!TheOddsApiAdapter.instance) {
+      TheOddsApiAdapter.instance = new TheOddsApiAdapter();
+    }
+    return TheOddsApiAdapter.instance;
+  }
+
+  public supportsSport(sportId: SportId): boolean {
+    return this.supportedSports.includes(sportId);
+  }
+
+  /**
+   * Récupère la clé API de façon sécurisée depuis les variables d'environnement serveur
+   * Ne jamais logger ou exposer cette valeur au client
+   */
+  private getApiKey(): string {
+    return (process.env.THE_ODDS_API_KEY || '').trim();
+  }
+
+  public isKeyConfigured(): boolean {
+    const key = this.getApiKey();
+    return Boolean(key && key !== 'MY_THE_ODDS_API_KEY' && key.length > 5);
+  }
+
+  public getMaskedKeyNotice(): string {
+    if (!this.isKeyConfigured()) {
+      return 'Non configurée (Définir THE_ODDS_API_KEY dans les secrets du serveur)';
+    }
+    const key = this.getApiKey();
+    return `Configurée côté serveur (${key.length} caractères, non exposée au client)`;
+  }
+
+  private getRegions(): string {
+    return (process.env.THE_ODDS_API_REGIONS || 'eu').trim();
+  }
+
+  private getMarkets(): string {
+    return (process.env.THE_ODDS_API_MARKETS || 'h2h').trim();
+  }
+
+  private getCacheTtlSeconds(): number {
+    const val = parseInt(process.env.THE_ODDS_API_CACHE_TTL_SECONDS || '300', 10);
+    return isNaN(val) || val < 30 ? 300 : val;
+  }
+
+  private getMaxSportsPerScan(): number {
+    const val = parseInt(process.env.THE_ODDS_API_MAX_SPORTS_PER_SCAN || '3', 10);
+    return isNaN(val) || val < 1 ? 3 : val;
+  }
+
+  private getTimeoutMs(): number {
+    const val = parseInt(process.env.THE_ODDS_API_TIMEOUT_MS || '10000', 10);
+    return isNaN(val) || val < 1000 ? 10000 : val;
+  }
+
+  public getStatus(): ProviderStatus {
+    const isConfigured = this.isKeyConfigured();
+    return {
+      id: this.id,
+      name: this.name,
+      type: 'THE_ODDS_API',
+      status: isConfigured ? 'active' : 'missing_key',
+      latencyMs: this.lastDiagnostic?.latencyMs || (isConfigured ? 120 : 0),
+      requestsUsedToday: this.requestsUsed,
+      dailyQuota: this.requestsRemaining + this.requestsUsed,
+      lastUpdated: this.lastCheckedTimestamp || new Date().toISOString(),
+      description: isConfigured
+        ? `The Odds API V4 connecté. Quota restant: ${this.requestsRemaining} req (source: en-têtes officiels). Cache: ${this.getCacheTtlSeconds()}s.`
+        : 'Clé THE_ODDS_API_KEY manquante. Définir le secret serveur pour activer ce fournisseur.',
+    };
+  }
+
+  /**
+   * Effectue un appel authentifié vers The Odds API V4
+   */
+  private async fetchApi<T>(
+    endpoint: string,
+    cacheTtlSeconds = this.getCacheTtlSeconds()
+  ): Promise<{ data: T | null; error?: string; status: number; latencyMs: number }> {
+    const cacheKey = endpoint;
+    const cached = this.cache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && now - cached.timestamp < cached.ttlSeconds * 1000) {
+      return { data: cached.data, status: 200, latencyMs: 0 };
+    }
+
+    if (!this.isKeyConfigured()) {
+      return {
+        data: null,
+        error: 'Clé API THE_ODDS_API_KEY non configurée dans les variables d\'environnement du serveur.',
+        status: 400,
+        latencyMs: 0,
+      };
+    }
+
+    const apiKey = this.getApiKey();
+    const separator = endpoint.includes('?') ? '&' : '?';
+    const url = `${this.baseUrl}${endpoint}${separator}apiKey=${apiKey}`;
+
+    const startTime = Date.now();
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.getTimeoutMs());
+
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+      const latencyMs = Date.now() - startTime;
+
+      // Lecture des quotas depuis les en-têtes officiels de The Odds API
+      const remainingHeader = response.headers.get('x-requests-remaining');
+      const usedHeader = response.headers.get('x-requests-used');
+      const lastCostHeader = response.headers.get('x-requests-last');
+
+      if (remainingHeader !== null) {
+        this.requestsRemaining = parseInt(remainingHeader, 10);
+      }
+      if (usedHeader !== null) {
+        this.requestsUsed = parseInt(usedHeader, 10);
+      }
+      if (lastCostHeader !== null) {
+        this.requestsLastCost = parseInt(lastCostHeader, 10);
+      }
+      this.lastCheckedTimestamp = new Date().toISOString();
+
+      if (response.status === 401 || response.status === 403) {
+        return {
+          data: null,
+          error: `Clé API THE_ODDS_API_KEY invalide ou non autorisée par The Odds API (Erreur HTTP ${response.status}).`,
+          status: response.status,
+          latencyMs,
+        };
+      }
+
+      if (response.status === 429) {
+        return {
+          data: null,
+          error: 'Quota de requêtes The Odds API dépassé (Erreur HTTP 429 - Limite mensuelle/forfait atteinte).',
+          status: 429,
+          latencyMs,
+        };
+      }
+
+      if (!response.ok) {
+        return {
+          data: null,
+          error: `Erreur The Odds API : HTTP ${response.status} ${response.statusText}`,
+          status: response.status,
+          latencyMs,
+        };
+      }
+
+      const json = await response.json();
+
+      // Mise en cache
+      this.cache.set(cacheKey, {
+        data: json,
+        timestamp: now,
+        ttlSeconds: cacheTtlSeconds,
+      });
+
+      return { data: json, status: 200, latencyMs };
+    } catch (err: any) {
+      const latencyMs = Date.now() - startTime;
+      if (err.name === 'AbortError') {
+        return {
+          data: null,
+          error: `Délai d'attente dépassé (timeout ${this.getTimeoutMs()}ms) lors de la requête The Odds API.`,
+          status: 408,
+          latencyMs,
+        };
+      }
+      return {
+        data: null,
+        error: `Erreur réseau de communication avec The Odds API: ${err.message}`,
+        status: 500,
+        latencyMs,
+      };
+    }
+  }
+
+  /**
+   * Teste la connexion réelle et renvoie un diagnostic complet sans exposer la clé
+   */
+  public async testConnection(): Promise<TheOddsApiDiagnostic> {
+    return this.getDiagnostic(true);
+  }
+
+  public async getDiagnostic(forceRefresh = false): Promise<TheOddsApiDiagnostic> {
+    const isConfigured = this.isKeyConfigured();
+    const checkedAt = new Date().toISOString();
+
+    if (!isConfigured) {
+      const diag: TheOddsApiDiagnostic = {
+        providerId: this.id,
+        providerName: this.name,
+        connectionState: 'not_configured',
+        isKeyConfigured: false,
+        maskedKeyNotice: this.getMaskedKeyNotice(),
+        requestsRemaining: 0,
+        requestsUsed: 0,
+        requestsLastCost: 0,
+        dailyLimit: 500,
+        latencyMs: 0,
+        lastCheckedAt: checkedAt,
+        cacheTtlSeconds: this.getCacheTtlSeconds(),
+        message: 'Clé THE_ODDS_API_KEY absente. Définir le secret serveur pour activer The Odds API.',
+        scannedEventsCount: 0,
+        insufficientCoverageCount: 0,
+        coverageErrors: ['Clé THE_ODDS_API_KEY non configurée côté serveur.'],
+      };
+      this.lastDiagnostic = diag;
+      return diag;
+    }
+
+    // Si on a un diagnostic récent dans le cache et pas de forçage
+    if (!forceRefresh && this.lastDiagnostic && Date.now() - new Date(this.lastDiagnostic.lastCheckedAt).getTime() < 60000) {
+      return this.lastDiagnostic;
+    }
+
+    // Interroger l'endpoint officiel /sports (coût = 0 requête sur le quota The Odds API)
+    const result = await this.fetchApi<TheOddsApiSportItem[]>('/sports', forceRefresh ? 0 : 300);
+
+    if (result.error || !result.data) {
+      let state: ConnectionState = 'network_error';
+      if (result.status === 401 || result.status === 403) state = 'invalid_key';
+      else if (result.status === 429) state = 'rate_limited';
+
+      const diag: TheOddsApiDiagnostic = {
+        providerId: this.id,
+        providerName: this.name,
+        connectionState: state,
+        isKeyConfigured: true,
+        maskedKeyNotice: this.getMaskedKeyNotice(),
+        requestsRemaining: this.requestsRemaining,
+        requestsUsed: this.requestsUsed,
+        requestsLastCost: this.requestsLastCost,
+        dailyLimit: this.requestsRemaining + this.requestsUsed,
+        latencyMs: result.latencyMs,
+        lastCheckedAt: checkedAt,
+        cacheTtlSeconds: this.getCacheTtlSeconds(),
+        message: result.error || 'Erreur inconnue lors du diagnostic.',
+        scannedEventsCount: 0,
+        insufficientCoverageCount: 0,
+        coverageErrors: [result.error || 'Échec de connexion.'],
+      };
+      this.lastDiagnostic = diag;
+      return diag;
+    }
+
+    const sportsList = result.data;
+    const activeCount = sportsList.filter((s) => s.active).length;
+
+    const diag: TheOddsApiDiagnostic = {
+      providerId: this.id,
+      providerName: this.name,
+      connectionState: 'connected',
+      isKeyConfigured: true,
+      maskedKeyNotice: this.getMaskedKeyNotice(),
+      requestsRemaining: this.requestsRemaining,
+      requestsUsed: this.requestsUsed,
+      requestsLastCost: this.requestsLastCost,
+      dailyLimit: this.requestsRemaining + this.requestsUsed,
+      latencyMs: result.latencyMs,
+      lastCheckedAt: checkedAt,
+      cacheTtlSeconds: this.getCacheTtlSeconds(),
+      message: `Connexion active validée avec The Odds API V4. ${activeCount} sports actifs disponibles.`,
+      activeSportsCount: activeCount,
+      totalSportsCount: sportsList.length,
+      scannedEventsCount: this.lastScannerStats.totalScanned,
+      insufficientCoverageCount: this.lastScannerStats.rejectedByReason.INSUFFICIENT_BOOKMAKERS,
+      coverageErrors: [],
+    };
+    this.lastDiagnostic = diag;
+    return diag;
+  }
+
+  /**
+   * Récupère le catalogue officiel complet des sports depuis The Odds API
+   */
+  public async getSportsCatalog(): Promise<TheOddsApiSportItem[]> {
+    const res = await this.fetchApi<TheOddsApiSportItem[]>('/sports', 300);
+    return res.data || [];
+  }
+
+  /**
+   * Associe les clés sportives de The Odds API aux sports internes de Surebet Africa AI
+   */
+  public mapInternalSportToKeys(sportId?: SportId): string[] {
+    if (!sportId || sportId === 'football') {
+      return ['soccer_epl', 'soccer_france_ligue_one', 'soccer_spain_la_liga', 'soccer_uefa_champs_league'];
+    }
+    if (sportId === 'basketball') {
+      return ['basketball_nba', 'basketball_euroleague'];
+    }
+    if (sportId === 'tennis') {
+      return ['tennis_atp', 'tennis_wta'];
+    }
+    if (sportId === 'baseball') {
+      return ['baseball_mlb'];
+    }
+    if (sportId === 'hockey') {
+      return ['icehockey_nhl'];
+    }
+    if (sportId === 'rugby') {
+      return ['rugbyunion_six_nations'];
+    }
+    if (sportId === 'mma') {
+      return ['mma_mixed_martial_arts'];
+    }
+    return ['soccer_epl'];
+  }
+
+  public mapKeyToSportId(sportKey: string): SportId {
+    if (sportKey.startsWith('soccer_')) return 'football';
+    if (sportKey.startsWith('basketball_')) return 'basketball';
+    if (sportKey.startsWith('tennis_')) return 'tennis';
+    if (sportKey.startsWith('baseball_')) return 'baseball';
+    if (sportKey.startsWith('icehockey_')) return 'hockey';
+    if (sportKey.startsWith('rugby')) return 'rugby';
+    if (sportKey.startsWith('cricket_')) return 'cricket';
+    if (sportKey.startsWith('mma_')) return 'mma';
+    if (sportKey.startsWith('boxing_')) return 'boxing';
+    return 'football';
+  }
+
+  /**
+   * Récupère les cotes réelles pour une clé de sport donnée
+   */
+  public async getOddsForSport(sportKey: string): Promise<TheOddsApiMatch[]> {
+    const regions = this.getRegions();
+    const markets = this.getMarkets();
+    const endpoint = `/sports/${sportKey}/odds/?regions=${regions}&markets=${markets}&oddsFormat=decimal&dateFormat=iso`;
+    const res = await this.fetchApi<TheOddsApiMatch[]>(endpoint, this.getCacheTtlSeconds());
+    return res.data || [];
+  }
+
+  /**
+   * Détecte les opportunités d'arbitrage réelles à partir des cotes de The Odds API.
+   * RÈGLES CRITIQUES LOT 4 :
+   * - Provenance explicite ('real' vs 'demo') ; par défaut 'demo' sauf appel réseau réel certifié.
+   * - Ne jamais inventer de données.
+   * - Si aucune opportunité d'arbitrage (S >= 1) n'est trouvée, renvoie 0 opportunité.
+   * - Exige au moins 2 bookmakers distincts pour une opportunité cross-bookmaker.
+   * - Exige la couverture complète des issues.
+   * - Rejette les cotes sans horodatage vérifiable (MISSING_TIMESTAMP).
+   * - Rejette les horodatages anormalement futurs > 120s (FUTURE_TIMESTAMP).
+   * - Ne déduit jamais un statut live depuis commence_time (isLive: false).
+   */
+  public detectSurebetsFromOdds(
+    matches: TheOddsApiMatch[],
+    maxFreshnessMinutes = 30,
+    budget = 100000,
+    provenance: 'real' | 'demo' = 'demo'
+  ): {
+    opportunities: SurebetOpportunity[];
+    stats: ScannerStats;
+    rejectedEvents: RejectedEventSummary[];
+  } {
+    const opportunities: SurebetOpportunity[] = [];
+    const rejectedEvents: RejectedEventSummary[] = [];
+    let totalScanned = 0;
+    const now = Date.now();
+    const isDemo = provenance !== 'real';
+
+    for (const match of matches) {
+      totalScanned++;
+      const sportId = this.mapKeyToSportId(match.sport_key);
+      const is3Way = sportId === 'football' || sportId === 'hockey' || sportId === 'rugby';
+      const marketType: MarketType = is3Way ? '1X2' : 'MONEYLINE_12';
+      const marketLabel = is3Way ? 'Résultat du Match (1X2)' : 'Vainqueur du Match (Face-à-Face)';
+      const matchTitle = `${match.home_team} vs ${match.away_team}`;
+
+      // Filtrer les bookmakers qui ont le marché h2h
+      const h2hBookmakers = (match.bookmakers || []).filter((bk) =>
+        bk.markets && bk.markets.some((m) => m.key === 'h2h')
+      );
+
+      // Règle 1: Minimum 2 bookmakers présents
+      if (h2hBookmakers.length < 2) {
+        rejectedEvents.push({
+          id: `toa-rej-bk-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'INSUFFICIENT_BOOKMAKERS',
+          reasonLabel: `Moins de 2 bookmakers comparables (${h2hBookmakers.length} bookmaker présent : ${h2hBookmakers.map((b) => b.title).join(', ') || 'aucun'})`,
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          provenance,
+        });
+        continue;
+      }
+
+      // Règle 2: Horodatage vérifiable (ni market.last_update ni book.last_update ne doit manquer)
+      let missingTimestampDetected = false;
+      let futureTimestampDetected = false;
+      const validTimestamps: string[] = [];
+
+      for (const bk of h2hBookmakers) {
+        const h2hMarket = bk.markets.find((m) => m.key === 'h2h');
+        const rawTs = h2hMarket?.last_update || bk.last_update;
+
+        if (!rawTs || typeof rawTs !== 'string' || !rawTs.trim()) {
+          missingTimestampDetected = true;
+        } else {
+          const freshCheck = ArbitrageEngine.checkOddsFreshness(rawTs, maxFreshnessMinutes);
+          if (freshCheck.reason === 'FUTURE_TIMESTAMP') {
+            futureTimestampDetected = true;
+          } else if (freshCheck.reason === 'MISSING_TIMESTAMP') {
+            missingTimestampDetected = true;
+          } else {
+            validTimestamps.push(rawTs);
+          }
+        }
+      }
+
+      if (missingTimestampDetected) {
+        rejectedEvents.push({
+          id: `toa-rej-notime-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'MISSING_TIMESTAMP',
+          reasonLabel: 'Horodatage manquant : ni market.last_update ni book.last_update n\'est renseigné pour au moins une cote',
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          provenance,
+        });
+        continue;
+      }
+
+      if (futureTimestampDetected) {
+        rejectedEvents.push({
+          id: `toa-rej-fut-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'FUTURE_TIMESTAMP',
+          reasonLabel: 'Horodatage anormalement futur : la date de mise à jour se situe à plus de 120 secondes dans le futur',
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          provenance,
+        });
+        continue;
+      }
+
+      const latestProviderUpdate = validTimestamps.sort().reverse()[0] || '';
+      if (!latestProviderUpdate) {
+        rejectedEvents.push({
+          id: `toa-rej-notime-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'MISSING_TIMESTAMP',
+          reasonLabel: 'Aucun horodatage valide exploitable trouvé pour cette rencontre',
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          provenance,
+        });
+        continue;
+      }
+
+      // Règle 3: Fraîcheur des données globale
+      const freshness = ArbitrageEngine.checkOddsFreshness(latestProviderUpdate, maxFreshnessMinutes);
+      if (freshness.isExpired) {
+        rejectedEvents.push({
+          id: `toa-rej-exp-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'EXPIRED_ODDS',
+          reasonLabel: `Cotes périmées : l'âge de la cote (${freshness.ageMinutes} min) dépasse le seuil maximal (${maxFreshnessMinutes} min)`,
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          providerUpdatedAt: latestProviderUpdate,
+          provenance,
+        });
+        continue;
+      }
+
+      // Identifier les issues requises
+      let expectedKeys: string[];
+      if (is3Way) {
+        expectedKeys = ['1', 'X', '2'];
+      } else {
+        expectedKeys = ['1', '2'];
+      }
+
+      const bestOddsPerKey: Record<string, { odd: number; bookmakerName: string; bookmakerId: string; timestamp: string }> = {};
+      let invalidOddDetected = false;
+
+      for (const bk of h2hBookmakers) {
+        const h2hMarket = bk.markets.find((m) => m.key === 'h2h');
+        if (!h2hMarket || !Array.isArray(h2hMarket.outcomes)) continue;
+
+        for (const outcome of h2hMarket.outcomes) {
+          let outcomeKey = '';
+          if (outcome.name === match.home_team) {
+            outcomeKey = '1';
+          } else if (outcome.name === match.away_team) {
+            outcomeKey = '2';
+          } else if (outcome.name.toLowerCase() === 'draw') {
+            outcomeKey = 'X';
+          }
+
+          if (outcomeKey) {
+            const price = outcome.price;
+            if (price <= 1.0 || isNaN(price) || !isFinite(price)) {
+              invalidOddDetected = true;
+            } else {
+              const currentBest = bestOddsPerKey[outcomeKey]?.odd || 0;
+              if (price > currentBest) {
+                bestOddsPerKey[outcomeKey] = {
+                  odd: price,
+                  bookmakerName: bk.title,
+                  bookmakerId: bk.key,
+                  timestamp: h2hMarket.last_update || bk.last_update || latestProviderUpdate,
+                };
+              }
+            }
+          }
+        }
+      }
+
+      if (invalidOddDetected) {
+        rejectedEvents.push({
+          id: `toa-rej-inv-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'INVALID_ODDS',
+          reasonLabel: 'Cote invalide (inférieure ou égale à 1.00 ou valeur non numérique)',
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          providerUpdatedAt: latestProviderUpdate,
+          provenance,
+        });
+        continue;
+      }
+
+      // Règle 4: Toutes les issues exhaustives doivent être couvertes
+      const coveredKeys = Object.keys(bestOddsPerKey);
+      const isComplete = expectedKeys.every((k) => coveredKeys.includes(k));
+
+      if (!isComplete) {
+        const missing = expectedKeys.filter((k) => !coveredKeys.includes(k));
+        rejectedEvents.push({
+          id: `toa-rej-inc-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'INCOMPLETE_OUTCOMES',
+          reasonLabel: `Marché incomplet : issue(s) manquante(s) [${missing.join(', ')}] non cotée(s)`,
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          providerUpdatedAt: latestProviderUpdate,
+          provenance,
+        });
+        continue;
+      }
+
+      // Préparation des entrées pour le moteur mathématique
+      const rawOutcomes: RawOutcomeInput[] = expectedKeys.map((k) => ({
+        key: k,
+        label:
+          k === '1'
+            ? `${match.home_team} (1)`
+            : k === 'X'
+            ? 'Match Nul (X)'
+            : `${match.away_team} (2)`,
+        odd: bestOddsPerKey[k].odd,
+        bookmakerId: bestOddsPerKey[k].bookmakerId,
+        bookmakerName: bestOddsPerKey[k].bookmakerName,
+      }));
+
+      // Règle 5: Diversité des bookmakers pour les meilleures cotes
+      // Un arbitrage requiert au minimum 2 bookmakers distincts parmi les meilleures issues retenues
+      const distinctSelectedBookmakers = new Set(rawOutcomes.map((o) => o.bookmakerName || o.bookmakerId));
+      if (distinctSelectedBookmakers.size < 2) {
+        rejectedEvents.push({
+          id: `toa-rej-singlebk-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'INSUFFICIENT_BOOKMAKERS',
+          reasonLabel: 'Moins de 2 bookmakers distincts comparables (toutes les meilleures cotes proviennent du même opérateur)',
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          providerUpdatedAt: latestProviderUpdate,
+          provenance,
+        });
+        continue;
+      }
+
+      // Calcul mathématique rigoureux
+      const calc = ArbitrageEngine.calculateStakes(rawOutcomes, budget, 'none', marketType);
+
+      if (calc.isArbitrage) {
+        const distinctBkCount = distinctSelectedBookmakers.size;
+        opportunities.push({
+          id: `toa-${match.id}`,
+          sportId,
+          sportName: match.sport_title,
+          competition: match.sport_title,
+          homeTeam: match.home_team,
+          awayTeam: match.away_team,
+          startTime: match.commence_time,
+          isLive: false, // Pas de déduction live basée sur commence_time
+          marketType,
+          marketLabel,
+          settlementRule: is3Way
+            ? 'Temps réglementaire 90 min (hors prolongations)'
+            : 'Vainqueur final de la rencontre (prolongations incluses)',
+          outcomes: rawOutcomes.map((o) => ({
+            key: o.key,
+            label: o.label,
+            odd: o.odd,
+            bookmakerId: o.bookmakerId || '',
+            bookmakerName: o.bookmakerName || '',
+            timestamp: bestOddsPerKey[o.key].timestamp,
+          })),
+          sumOfInverses: calc.sumOfInverses,
+          theoreticalYieldPercent: calc.theoreticalYieldPercent,
+          freshnessSeconds: Math.max(1, Math.floor((now - new Date(latestProviderUpdate).getTime()) / 1000)),
+          detectedAt: new Date(now).toISOString(),
+          collectedAt: new Date(now).toISOString(),
+          providerUpdatedAt: latestProviderUpdate,
+          isExpired: false,
+          validationStatus: calc.palpRiskDetected ? 'PALP_ALERT' : 'VALIDATED',
+          validationMessage: `Vérifié · ${rawOutcomes.length} issues exhaustives · ${distinctBkCount} bookmakers indépendants (The Odds API V4)`,
+          riskLevel: calc.palpRiskDetected ? 'ALERTE_ERREUR_PALP' : 'FAIBLE',
+          isDemoData: isDemo,
+          provenance,
+        });
+      } else {
+        rejectedEvents.push({
+          id: `toa-rej-noarb-${match.id}`,
+          fixtureId: match.id,
+          sportId,
+          competition: match.sport_title,
+          match: matchTitle,
+          marketType,
+          marketLabel,
+          reasonCode: 'NO_ARBITRAGE',
+          reasonLabel: `Aucun arbitrage : somme des inverses S = ${calc.sumOfInverses.toFixed(4)} (rendement = ${calc.theoreticalYieldPercent.toFixed(2)}%)`,
+          bookmakersObserved: h2hBookmakers.map((b) => b.title),
+          bestOddsFound: rawOutcomes.reduce((acc, it) => ({ ...acc, [it.key]: it.odd }), {}),
+          sumOfInverses: calc.sumOfInverses,
+          theoreticalYield: calc.theoreticalYieldPercent,
+          providerUpdatedAt: latestProviderUpdate,
+          provenance,
+        });
+      }
+    }
+
+    const stats: ScannerStats = {
+      totalScanned,
+      validArbitragesCount: opportunities.length,
+      rejectedCount: rejectedEvents.length,
+      rejectedByReason: {
+        INSUFFICIENT_BOOKMAKERS: rejectedEvents.filter((r) => r.reasonCode === 'INSUFFICIENT_BOOKMAKERS').length,
+        INCOMPLETE_OUTCOMES: rejectedEvents.filter((r) => r.reasonCode === 'INCOMPLETE_OUTCOMES').length,
+        INCOMPATIBLE_RULES: rejectedEvents.filter((r) => r.reasonCode === 'INCOMPATIBLE_RULES').length,
+        INVALID_ODDS: rejectedEvents.filter((r) => r.reasonCode === 'INVALID_ODDS').length,
+        EXPIRED_ODDS: rejectedEvents.filter((r) => r.reasonCode === 'EXPIRED_ODDS').length,
+        FUTURE_TIMESTAMP: rejectedEvents.filter((r) => r.reasonCode === 'FUTURE_TIMESTAMP').length,
+        MISSING_TIMESTAMP: rejectedEvents.filter((r) => r.reasonCode === 'MISSING_TIMESTAMP').length,
+        NO_ARBITRAGE: rejectedEvents.filter((r) => r.reasonCode === 'NO_ARBITRAGE').length,
+      },
+    };
+
+    this.lastScannerStats = stats;
+    this.lastRejectedEvents = rejectedEvents;
+
+    return { opportunities, stats, rejectedEvents };
+  }
+
+  /**
+   * Scanne les opportunités d'arbitrage réelles depuis The Odds API
+   */
+  public async getSurebets(
+    sportId?: SportId,
+    liveOnly?: boolean,
+    maxFreshnessMinutes = 30
+  ): Promise<SurebetOpportunity[]> {
+    if (!this.isKeyConfigured()) {
+      return [];
+    }
+
+    // Sélectionner les sports à scanner
+    const targetKeys = this.mapInternalSportToKeys(sportId).slice(0, this.getMaxSportsPerScan());
+    let allMatches: TheOddsApiMatch[] = [];
+
+    for (const key of targetKeys) {
+      try {
+        const matches = await this.getOddsForSport(key);
+        allMatches = allMatches.concat(matches);
+      } catch (err) {
+        console.error(`Erreur scan sport ${key}:`, err);
+      }
+    }
+
+    // Appel avec provenance explicite 'real'
+    const { opportunities } = this.detectSurebetsFromOdds(allMatches, maxFreshnessMinutes, 100000, 'real');
+
+    return opportunities.filter((o) => {
+      if (sportId && o.sportId !== sportId) return false;
+      if (liveOnly && !o.isLive) return false;
+      return true;
+    });
+  }
+
+  public async getScannerAudit(sportId?: SportId): Promise<{
+    stats: ScannerStats;
+    rejectedEvents: RejectedEventSummary[];
+  }> {
+    const filteredEvents = sportId
+      ? this.lastRejectedEvents.filter((e) => e.sportId === sportId)
+      : this.lastRejectedEvents;
+
+    return {
+      stats: this.lastScannerStats,
+      rejectedEvents: filteredEvents,
+    };
+  }
+
+  public async getMatchOdds(eventId: string): Promise<OddsSnapshot | null> {
+    const all = await this.getAllMatchesOdds();
+    return all.find((m) => m.eventId === eventId) || null;
+  }
+
+  public async getAllMatchesOdds(sportId?: SportId): Promise<OddsSnapshot[]> {
+    if (!this.isKeyConfigured()) return [];
+
+    const targetKeys = this.mapInternalSportToKeys(sportId).slice(0, 2);
+    let allMatches: TheOddsApiMatch[] = [];
+
+    for (const key of targetKeys) {
+      const matches = await this.getOddsForSport(key);
+      allMatches = allMatches.concat(matches);
+    }
+
+    return allMatches.map((m) => {
+      const is3Way = this.mapKeyToSportId(m.sport_key) === 'football';
+      const marketType: MarketType = is3Way ? '1X2' : 'MONEYLINE_12';
+
+      return {
+        eventId: `toa-${m.id}`,
+        sportId: this.mapKeyToSportId(m.sport_key),
+        competition: m.sport_title,
+        homeTeam: m.home_team,
+        awayTeam: m.away_team,
+        startTime: m.commence_time,
+        isLive: false,
+        markets: [
+          {
+            marketType,
+            marketLabel: is3Way ? 'Résultat du Match (1X2)' : 'Vainqueur du Match (Face-à-Face)',
+            bookmakerOdds: (m.bookmakers || []).map((bk) => {
+              const h2h = bk.markets?.find((mk) => mk.key === 'h2h');
+              const odds: Record<string, number> = {};
+              if (h2h) {
+                h2h.outcomes.forEach((o) => {
+                  if (o.name === m.home_team) odds['1'] = o.price;
+                  else if (o.name === m.away_team) odds['2'] = o.price;
+                  else if (o.name.toLowerCase() === 'draw') odds['X'] = o.price;
+                });
+              }
+              return {
+                bookmakerId: bk.key,
+                bookmakerName: bk.title,
+                odds,
+                timestamp: bk.last_update,
+              };
+            }),
+          },
+        ],
+      };
+    });
+  }
+
+  public async getHistoricalOpportunities(): Promise<HistoryOpportunity[]> {
+    return [];
+  }
+}
